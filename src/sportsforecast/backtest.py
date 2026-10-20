@@ -6,10 +6,11 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize_scalar
 
 from . import stacking
 from .data import BOOKMAKERS
-from .dixon_coles import DixonColes, DixonColesConfig
+from .dixon_coles import DixonColes, DixonColesConfig, markets, score_matrix
 from .elo import Elo, EloConfig, OrderedLogit
 from .metrics import OUTCOME_INDEX
 from .odds import devig
@@ -79,7 +80,10 @@ def run(matches: pd.DataFrame, cfg: BacktestConfig | None = None) -> BacktestRes
             if dc:
                 p_dc = dc.predict(m.home, m.away)
                 row.update({"dc_H": p_dc["H"], "dc_D": p_dc["D"], "dc_A": p_dc["A"],
-                            "dc_over25": p_dc["over25"], "dc_btts": p_dc["btts"]})
+                            "dc_over25": p_dc["over25"], "dc_btts": p_dc["btts"],
+                            "dc_lam": p_dc["lam"], "dc_mu": p_dc["mu"], "dc_rho": p_dc["rho"]})
+                if "home_lineup_delta" in matches:
+                    row.update({"home_lineup_delta": m.home_lineup_delta, "away_lineup_delta": m.away_lineup_delta})
             if dcx:
                 p_dcx = dcx.predict(m.home, m.away)
                 row.update({"dcx_H": p_dcx["H"], "dcx_D": p_dcx["D"], "dcx_A": p_dcx["A"]})
@@ -96,18 +100,57 @@ def run(matches: pd.DataFrame, cfg: BacktestConfig | None = None) -> BacktestRes
     scored = matches[matches["season"].isin(test_seasons)].reset_index(drop=True)
     _attach_market(preds, scored, cfg.devig_method)
 
-    models = ["elo"] + (["dc"] if dc else []) + (["dcx"] if dcx else [])
+    weights = {}
+    use_lineups = dc is not None and "home_lineup_delta" in preds and preds["home_lineup_delta"].notna().any()
+    if use_lineups:
+        weights["lineup_beta"] = _lineup_adjusted(preds, cfg.refit_days, cfg.stack_min_train, cfg.dc.max_goals)
+
+    models = (["elo"] + (["dc"] if dc else []) + (["dcx"] if dcx else [])
+              + (["dcl"] if use_lineups else []))
     pools = {"blend": models} if len(models) > 1 else {}
     if "mkt_H" in preds:
         pools["stack"] = models + ["mkt"]
     if "open_H" in preds:
         pools["stack_open"] = models + ["open"]
-    weights = {}
     for name, components in pools.items():
         probs, weights[name] = stacking.walk_forward(preds, components, name, cfg.refit_days, cfg.stack_min_train)
         preds[probs.columns] = probs
 
     return BacktestResult(preds, weights)
+
+
+def _lineup_adjusted(preds: pd.DataFrame, refit_days: int, min_train: int, max_goals: int) -> pd.DataFrame:
+    """dcl: Dixon-Coles rates scaled by exp(beta * lineup delta); beta fitted walk-forward by Poisson likelihood.
+
+    Matches without lineup data fall back to plain Dixon-Coles (delta = 0).
+    """
+    dh = preds["home_lineup_delta"].fillna(0.0).to_numpy()
+    da = preds["away_lineup_delta"].fillna(0.0).to_numpy()
+    has = preds["home_lineup_delta"].notna().to_numpy() & preds["away_lineup_delta"].notna().to_numpy()
+    lam, mu = preds["dc_lam"].to_numpy(), preds["dc_mu"].to_numpy()
+    hg, ag = preds["hg"].to_numpy(), preds["ag"].to_numpy()
+    dates = preds["date"].to_numpy()
+
+    def neg_ll(beta: float, idx: np.ndarray) -> float:
+        el, em = lam[idx] * np.exp(beta * dh[idx]), mu[idx] * np.exp(beta * da[idx])
+        return -(hg[idx] * np.log(el) - el + ag[idx] * np.log(em) - em).sum()
+
+    beta, next_refit, history = 0.0, None, []
+    probs = np.full((len(preds), 3), np.nan)
+    for d in np.unique(dates):
+        train = np.flatnonzero((dates < d) & has)
+        # Until enough lineups are seen beta stays 0, i.e. dcl equals plain Dixon-Coles
+        if len(train) >= min_train and (next_refit is None or d >= next_refit):
+            beta = minimize_scalar(neg_ll, bounds=(-2.0, 3.0), args=(train,), method="bounded").x
+            next_refit = d + np.timedelta64(refit_days, "D")
+            history.append({"date": pd.Timestamp(d), "beta": beta})
+        for i in np.flatnonzero(dates == d):
+            mat = score_matrix(lam[i] * np.exp(beta * dh[i]), mu[i] * np.exp(beta * da[i]),
+                               preds["dc_rho"].iat[i], max_goals)
+            mk = markets(mat)
+            probs[i] = mk["H"], mk["D"], mk["A"]
+    preds[["dcl_H", "dcl_D", "dcl_A"]] = probs
+    return pd.DataFrame(history)
 
 
 def _attach_market(preds: pd.DataFrame, scored: pd.DataFrame, method: str) -> None:

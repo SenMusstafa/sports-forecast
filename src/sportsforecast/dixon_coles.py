@@ -114,26 +114,38 @@ class DixonColes:
         weakest = np.argsort(self.attack - self.defence)[:3]
         return self.attack[weakest].mean(), self.defence[weakest].mean()
 
-    def score_matrix(self, home: str, away: str) -> np.ndarray:
+    def rates(self, home: str, away: str) -> tuple[float, float]:
+        """Expected goals (lambda, mu) for home and away side."""
         ah, dh = self._params(home)
         aa, da = self._params(away)
-        lam = np.exp(self.home + ah + da)
-        mu = np.exp(aa + dh)
-        goals = np.arange(self.config.max_goals + 1)
-        mat = np.outer(poisson.pmf(goals, lam), poisson.pmf(goals, mu))
-        mat[0, 0] *= 1 - lam * mu * self.rho
-        mat[0, 1] *= 1 + lam * self.rho
-        mat[1, 0] *= 1 + mu * self.rho
-        mat[1, 1] *= 1 - self.rho
-        return mat / mat.sum()
+        return float(np.exp(self.home + ah + da)), float(np.exp(aa + dh))
+
+    def score_matrix(self, home: str, away: str) -> np.ndarray:
+        lam, mu = self.rates(home, away)
+        return score_matrix(lam, mu, self.rho, self.config.max_goals)
 
     def predict(self, home: str, away: str) -> dict[str, float]:
-        mat = self.score_matrix(home, away)
-        total = np.add.outer(np.arange(mat.shape[0]), np.arange(mat.shape[1]))
-        return {
-            "H": np.tril(mat, -1).sum(),
-            "D": np.trace(mat),
-            "A": np.triu(mat, 1).sum(),
-            "over25": mat[total > 2.5].sum(),
-            "btts": mat[1:, 1:].sum(),
-        }
+        lam, mu = self.rates(home, away)
+        return {**markets(score_matrix(lam, mu, self.rho, self.config.max_goals)),
+                "lam": lam, "mu": mu, "rho": self.rho}
+
+
+def score_matrix(lam: float, mu: float, rho: float, max_goals: int = 10) -> np.ndarray:
+    goals = np.arange(max_goals + 1)
+    mat = np.outer(poisson.pmf(goals, lam), poisson.pmf(goals, mu))
+    mat[0, 0] *= 1 - lam * mu * rho
+    mat[0, 1] *= 1 + lam * rho
+    mat[1, 0] *= 1 + mu * rho
+    mat[1, 1] *= 1 - rho
+    return mat / mat.sum()
+
+
+def markets(mat: np.ndarray) -> dict[str, float]:
+    total = np.add.outer(np.arange(mat.shape[0]), np.arange(mat.shape[1]))
+    return {
+        "H": np.tril(mat, -1).sum(),
+        "D": np.trace(mat),
+        "A": np.triu(mat, 1).sum(),
+        "over25": mat[total > 2.5].sum(),
+        "btts": mat[1:, 1:].sum(),
+    }
