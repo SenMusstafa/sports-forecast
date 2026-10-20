@@ -15,6 +15,7 @@ class DixonColesConfig:
     window_days: int = 3 * 365  # matches older than this are ignored
     ridge: float = 0.01         # L2 on attack/defence, stabilises teams with few matches
     max_goals: int = 10
+    xg_weight: float = 0.0      # >0: fit on w*xG + (1-w)*goals where xG is available
 
 
 def _tau(hg: np.ndarray, ag: np.ndarray, lam: np.ndarray, mu: np.ndarray, rho: float) -> np.ndarray:
@@ -54,6 +55,12 @@ class DixonColes:
         ai = m["away"].map(self.teams).to_numpy()
         hg = m["hg"].to_numpy()
         ag = m["ag"].to_numpy()
+        # Poisson term accepts non-integer "goals"; the low-score correction keeps using real scores
+        hs, as_ = hg.astype(float), ag.astype(float)
+        if cfg.xg_weight > 0 and "hxg" in m:
+            has = m["hxg"].notna().to_numpy() & m["axg"].notna().to_numpy()
+            hs[has] = cfg.xg_weight * m["hxg"].to_numpy()[has] + (1 - cfg.xg_weight) * hg[has]
+            as_[has] = cfg.xg_weight * m["axg"].to_numpy()[has] + (1 - cfg.xg_weight) * ag[has]
 
         def unpack(p: np.ndarray):
             att = p[:n] - p[:n].mean()
@@ -64,7 +71,7 @@ class DixonColes:
             lam = np.exp(home + att[hi] + dfc[ai])
             mu = np.exp(att[ai] + dfc[hi])
             tau = np.clip(_tau(hg, ag, lam, mu, rho), 1e-10, None)
-            ll = np.log(tau) + hg * np.log(lam) - lam + ag * np.log(mu) - mu
+            ll = np.log(tau) + hs * np.log(lam) - lam + as_ * np.log(mu) - mu
             return -(w * ll).sum() + cfg.ridge * (att @ att + dfc @ dfc)
 
         # Warm start from previous fit for teams already known
