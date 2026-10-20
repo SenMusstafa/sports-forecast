@@ -66,13 +66,33 @@ class DixonColes:
             att = p[:n] - p[:n].mean()
             return att, p[n:2 * n], p[2 * n], p[2 * n + 1]
 
-        def nll(p: np.ndarray) -> float:
+        m00, m01 = (hg == 0) & (ag == 0), (hg == 0) & (ag == 1)
+        m10, m11 = (hg == 1) & (ag == 0), (hg == 1) & (ag == 1)
+
+        def nll_grad(p: np.ndarray) -> tuple[float, np.ndarray]:
             att, dfc, home, rho = unpack(p)
             lam = np.exp(home + att[hi] + dfc[ai])
             mu = np.exp(att[ai] + dfc[hi])
             tau = np.clip(_tau(hg, ag, lam, mu, rho), 1e-10, None)
             ll = np.log(tau) + hs * np.log(lam) - lam + as_ * np.log(mu) - mu
-            return -(w * ll).sum() + cfg.ridge * (att @ att + dfc @ dfc)
+            f = -(w * ll).sum() + cfg.ridge * (att @ att + dfc @ dfc)
+
+            # d log(tau) / d log(lam), d log(mu), d rho for the four corrected scorelines
+            t_lam, t_mu, t_rho = np.zeros_like(lam), np.zeros_like(lam), np.zeros_like(lam)
+            t_lam[m00] = t_mu[m00] = -lam[m00] * mu[m00] * rho / tau[m00]
+            t_rho[m00] = -lam[m00] * mu[m00] / tau[m00]
+            t_lam[m01] = lam[m01] * rho / tau[m01]
+            t_rho[m01] = lam[m01] / tau[m01]
+            t_mu[m10] = mu[m10] * rho / tau[m10]
+            t_rho[m10] = mu[m10] / tau[m10]
+            t_rho[m11] = -1.0 / tau[m11]
+
+            g_lam = -w * (hs - lam + t_lam)  # gradient w.r.t. log(lam)
+            g_mu = -w * (as_ - mu + t_mu)    # gradient w.r.t. log(mu)
+            g_att = np.bincount(hi, g_lam, n) + np.bincount(ai, g_mu, n) + 2 * cfg.ridge * att
+            g_dfc = np.bincount(ai, g_lam, n) + np.bincount(hi, g_mu, n) + 2 * cfg.ridge * dfc
+            grad = np.concatenate([g_att - g_att.mean(), g_dfc, [g_lam.sum(), -(w * t_rho).sum()]])
+            return f, grad
 
         # Warm start from previous fit for teams already known
         x0 = np.zeros(2 * n + 2)
@@ -80,7 +100,7 @@ class DixonColes:
             x0[i], x0[n + i] = self._x0.get(t, (0.0, 0.0))
         x0[2 * n], x0[2 * n + 1] = self.home, self.rho
         bounds = [(None, None)] * (2 * n + 1) + [(-0.3, 0.3)]
-        res = minimize(nll, x0, method="L-BFGS-B", bounds=bounds)
+        res = minimize(nll_grad, x0, jac=True, method="L-BFGS-B", bounds=bounds)
 
         self.attack, self.defence, self.home, self.rho = unpack(res.x)
         self._x0 = {t: (self.attack[i], self.defence[i]) for t, i in self.teams.items()}
