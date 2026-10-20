@@ -11,7 +11,8 @@ from pathlib import Path
 import pandas as pd
 
 from . import backtest, clv, metrics, players, predict, report, tuning, understat, xg
-from .data import OFFICIAL_URL
+from .data import OFFICIAL_URL, current_season
+from .understat import UnderstatError
 from .data import DataSourceError, load_league
 
 
@@ -188,7 +189,7 @@ def _probe_match(league: str, year: int) -> str:
 def cmd_predict(args: argparse.Namespace) -> int:
     as_of = pd.Timestamp(args.as_of) if args.as_of else pd.Timestamp.today().normalize()
     if args.seasons is None:
-        last = int(predict.current_season(as_of)[:2])
+        last = int(current_season(as_of)[:2])
         args.seasons = f"{last - args.history:02d}{last - args.history + 1:02d}-{last:02d}{last + 1:02d}"
     history = _load(args)
     if history is None:
@@ -198,7 +199,19 @@ def cmd_predict(args: argparse.Namespace) -> int:
     except DataSourceError as exc:
         print(exc, file=sys.stderr)
         return 2
-    window = fixtures[(fixtures["date"] >= as_of) & (fixtures["date"] < as_of + pd.Timedelta(days=args.days))]
+    def in_window(f: pd.DataFrame) -> pd.DataFrame:
+        return f[(f["date"] >= as_of) & (f["date"] < as_of + pd.Timedelta(days=args.days))]
+
+    window = in_window(fixtures)
+    if window.empty and args.xg:
+        try:
+            window = in_window(predict.understat_fixtures(history, args.league, Path(args.data_dir),
+                                                          current_season(as_of)))
+            if not window.empty:
+                print(f"fixtures.csv has no {args.league} matches in the window; using the Understat "
+                      f"schedule (no odds, so no market comparison)")
+        except UnderstatError as exc:
+            print(f"understat fallback failed: {exc}", file=sys.stderr)
     if window.empty:
         span = (f"{len(fixtures)} {args.league} fixtures dated {fixtures['date'].min():%Y-%m-%d}.."
                 f"{fixtures['date'].max():%Y-%m-%d}" if len(fixtures) else f"no {args.league} fixtures at all")

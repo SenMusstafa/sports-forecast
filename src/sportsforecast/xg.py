@@ -8,34 +8,55 @@ from pathlib import Path
 
 import pandas as pd
 
+from .data import is_fresh
 from .understat import LEAGUES, UnderstatError, league_dates
 
 log = logging.getLogger(__name__)
 
 
-def fetch_season(code: str, season: str, cache_dir: Path) -> pd.DataFrame:
-    """season '2324' -> understat year 2023. Cached as JSON; only finished matches are returned."""
+def season_dates(code: str, season: str, cache_dir: Path) -> list[dict]:
+    """Raw Understat fixtures (played and upcoming) for season '2324' -> understat year 2023."""
     league = LEAGUES.get(code)
     if league is None:
         raise UnderstatError(f"no understat league for {code}")
     year = 2000 + int(season[:2])
     cache = cache_dir / f"understat_{code}_{season}.json"
-    if cache.exists():
-        dates = json.loads(cache.read_text())
-    else:
+    if is_fresh(cache, season):
+        return json.loads(cache.read_text())
+    try:
         dates = league_dates(league, year)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache.write_text(json.dumps(dates))
-        log.info("downloaded understat %s %d (%d matches)", league, year, len(dates))
+    except UnderstatError:
+        if cache.exists():
+            log.warning("understat %s %d refresh failed, using cached copy", league, year)
+            return json.loads(cache.read_text())
+        raise
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(dates))
+    log.info("downloaded understat %s %d (%d matches)", league, year, len(dates))
+    return dates
 
+
+def fetch_season(code: str, season: str, cache_dir: Path) -> pd.DataFrame:
+    """Finished matches with xG."""
     rows = [{
         "us_id": str(d["id"]),
         "date": pd.Timestamp(d["datetime"]).normalize(),
         "home": d["h"]["title"], "away": d["a"]["title"],
         "hg": int(d["goals"]["h"]), "ag": int(d["goals"]["a"]),
         "hxg": float(d["xG"]["h"]), "axg": float(d["xG"]["a"]),
-    } for d in dates if d.get("isResult") and d.get("xG", {}).get("h") is not None]
+    } for d in season_dates(code, season, cache_dir)
+        if d.get("isResult") and d.get("xG", {}).get("h") is not None]
     return pd.DataFrame(rows)
+
+
+def upcoming(code: str, season: str, cache_dir: Path) -> pd.DataFrame:
+    """Scheduled, not yet played matches (Understat team names)."""
+    rows = [{
+        "date": pd.Timestamp(d["datetime"]).normalize(),
+        "time": pd.Timestamp(d["datetime"]).strftime("%H:%M"),
+        "home": d["h"]["title"], "away": d["a"]["title"],
+    } for d in season_dates(code, season, cache_dir) if not d.get("isResult")]
+    return pd.DataFrame(rows, columns=["date", "time", "home", "away"])
 
 
 def build_team_mapping(left: pd.DataFrame, right: pd.DataFrame, tolerance_days: int = 1) -> dict[str, str]:
@@ -56,8 +77,13 @@ def build_team_mapping(left: pd.DataFrame, right: pd.DataFrame, tolerance_days: 
             votes[r.home][lh] += 1 / len(candidates)
             votes[r.away][la] += 1 / len(candidates)
 
+    left_names = set(left["home"]) | set(left["away"])
     mapping = {}
     for right_name, counter in votes.items():
+        # Identical names need no evidence; matters for promoted teams with only a few matches so far
+        if right_name in left_names:
+            mapping[right_name] = right_name
+            continue
         (best, n), total = counter.most_common(1)[0], sum(counter.values())
         if n >= 3 and n / total >= 0.5:
             mapping[right_name] = best

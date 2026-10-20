@@ -18,7 +18,8 @@ import pandas as pd
 
 from . import backtest
 from .backtest import BacktestConfig
-from .data import DataSourceError, read_csv
+from . import xg
+from .data import DataSourceError, current_season, read_csv
 from .dixon_coles import DixonColes, markets, score_matrix
 from .elo import Elo, OrderedLogit
 from .metrics import OUTCOME_INDEX, evaluate
@@ -28,12 +29,6 @@ log = logging.getLogger(__name__)
 
 FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
 FIXTURE_ODDS = [("PSH", "PSD", "PSA"), ("AvgH", "AvgD", "AvgA"), ("B365H", "B365D", "B365A")]
-
-
-def current_season(today: pd.Timestamp) -> str:
-    """Football season code for a date: Aug 2026 -> '2627', Mar 2027 -> '2627'."""
-    start = today.year if today.month >= 7 else today.year - 1
-    return f"{start % 100:02d}{(start + 1) % 100:02d}"
 
 
 def fetch_fixtures(code: str, cache_dir: Path, max_age_hours: float = 3.0) -> pd.DataFrame:
@@ -71,6 +66,23 @@ def fetch_fixtures(code: str, cache_dir: Path, max_age_hours: float = 3.0) -> pd
     if {"Avg>2.5", "Avg<2.5"} <= set(raw.columns):
         df[["odds_over", "odds_under"]] = raw[["Avg>2.5", "Avg<2.5"]].to_numpy(dtype=float)
     return df.sort_values(["date", "time"]).reset_index(drop=True)
+
+
+def understat_fixtures(history: pd.DataFrame, code: str, cache_dir: Path, season: str) -> pd.DataFrame:
+    """Fallback schedule without odds, team names mapped onto football-data names via played matches."""
+    played = pd.concat([xg.fetch_season(code, s, cache_dir) for s in history["season"].unique()],
+                       ignore_index=True)
+    mapping = xg.build_team_mapping(history, played)
+    fixtures = xg.upcoming(code, season, cache_dir)
+    # Teams with no played match in history yet (e.g. promoted, before their first game) map by name only
+    known = set(history["home"]) | set(history["away"])
+    mapping.update({t: t for t in set(fixtures["home"]) | set(fixtures["away"]) if t in known and t not in mapping})
+    fixtures["home"] = fixtures["home"].map(mapping)
+    fixtures["away"] = fixtures["away"].map(mapping)
+    unmapped = fixtures["home"].isna() | fixtures["away"].isna()
+    if unmapped.any():
+        log.warning("%d understat fixtures dropped: team names could not be mapped", unmapped.sum())
+    return fixtures[~unmapped].sort_values(["date", "time"]).reset_index(drop=True)
 
 
 def fixture_leagues(cache_dir: Path) -> list[str]:
