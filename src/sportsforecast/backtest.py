@@ -86,7 +86,8 @@ def run(matches: pd.DataFrame, cfg: BacktestConfig | None = None) -> BacktestRes
                     row.update({"home_lineup_delta": m.home_lineup_delta, "away_lineup_delta": m.away_lineup_delta})
             if dcx:
                 p_dcx = dcx.predict(m.home, m.away)
-                row.update({"dcx_H": p_dcx["H"], "dcx_D": p_dcx["D"], "dcx_A": p_dcx["A"]})
+                row.update({"dcx_H": p_dcx["H"], "dcx_D": p_dcx["D"], "dcx_A": p_dcx["A"],
+                            "dcx_lam": p_dcx["lam"], "dcx_mu": p_dcx["mu"], "dcx_rho": p_dcx["rho"]})
             rows.append(row)
 
         elo.update(m.home, m.away, m.hg, m.ag)
@@ -103,7 +104,9 @@ def run(matches: pd.DataFrame, cfg: BacktestConfig | None = None) -> BacktestRes
     weights = {}
     use_lineups = dc is not None and "home_lineup_delta" in preds and preds["home_lineup_delta"].notna().any()
     if use_lineups:
-        weights["lineup_beta"] = _lineup_adjusted(preds, cfg.refit_days, cfg.stack_min_train, cfg.dc.max_goals)
+        # Adjust the strongest available goal model: xG-based when present
+        base = "dcx" if dcx else "dc"
+        weights["lineup_beta"] = _lineup_adjusted(preds, base, cfg.refit_days, cfg.stack_min_train, cfg.dc.max_goals)
 
     models = (["elo"] + (["dc"] if dc else []) + (["dcx"] if dcx else [])
               + (["dcl"] if use_lineups else []))
@@ -119,15 +122,16 @@ def run(matches: pd.DataFrame, cfg: BacktestConfig | None = None) -> BacktestRes
     return BacktestResult(preds, weights)
 
 
-def _lineup_adjusted(preds: pd.DataFrame, refit_days: int, min_train: int, max_goals: int) -> pd.DataFrame:
-    """dcl: Dixon-Coles rates scaled by exp(beta * lineup delta); beta fitted walk-forward by Poisson likelihood.
+def _lineup_adjusted(preds: pd.DataFrame, base: str, refit_days: int, min_train: int,
+                     max_goals: int) -> pd.DataFrame:
+    """dcl: base model rates scaled by exp(beta * lineup delta); beta fitted walk-forward by Poisson likelihood.
 
-    Matches without lineup data fall back to plain Dixon-Coles (delta = 0).
+    Matches without lineup data fall back to the base model (delta = 0).
     """
     dh = preds["home_lineup_delta"].fillna(0.0).to_numpy()
     da = preds["away_lineup_delta"].fillna(0.0).to_numpy()
     has = preds["home_lineup_delta"].notna().to_numpy() & preds["away_lineup_delta"].notna().to_numpy()
-    lam, mu = preds["dc_lam"].to_numpy(), preds["dc_mu"].to_numpy()
+    lam, mu = preds[f"{base}_lam"].to_numpy(), preds[f"{base}_mu"].to_numpy()
     hg, ag = preds["hg"].to_numpy(), preds["ag"].to_numpy()
     dates = preds["date"].to_numpy()
 
@@ -146,7 +150,7 @@ def _lineup_adjusted(preds: pd.DataFrame, refit_days: int, min_train: int, max_g
             history.append({"date": pd.Timestamp(d), "beta": beta})
         for i in np.flatnonzero(dates == d):
             mat = score_matrix(lam[i] * np.exp(beta * dh[i]), mu[i] * np.exp(beta * da[i]),
-                               preds["dc_rho"].iat[i], max_goals)
+                               preds[f"{base}_rho"].iat[i], max_goals)
             mk = markets(mat)
             probs[i] = mk["H"], mk["D"], mk["A"]
     preds[["dcl_H", "dcl_D", "dcl_A"]] = probs
