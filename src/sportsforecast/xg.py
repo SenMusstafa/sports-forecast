@@ -1,72 +1,35 @@
 """Expected goals (xG) from Understat, merged onto football-data matches."""
 from __future__ import annotations
 
-import codecs
 import json
 import logging
-import re
-import urllib.error
-import urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
 
 import pandas as pd
 
+from .understat import LEAGUES, UnderstatError, league_dates
+
 log = logging.getLogger(__name__)
-
-UNDERSTAT_LEAGUES = {"E0": "EPL", "SP1": "La_liga", "I1": "Serie_A", "D1": "Bundesliga", "F1": "Ligue_1"}
-PAGE_URL = "https://understat.com/league/{league}/{year}"
-API_URL = "https://understat.com/getLeagueData/{league}/{year}"
-
-
-class XgSourceError(RuntimeError):
-    pass
-
-
-def _get(url: str, ajax: bool = False, timeout: float = 30.0) -> str:
-    headers = {"User-Agent": "Mozilla/5.0 (sportsforecast research)"}
-    if ajax:
-        headers["X-Requested-With"] = "XMLHttpRequest"
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8")
-
-
-def _parse_dates(league: str, year: int) -> list[dict]:
-    """Understat used to embed `datesData` in the page; newer versions serve it from a JSON endpoint."""
-    errors = []
-    try:
-        html = _get(PAGE_URL.format(league=league, year=year))
-        m = re.search(r"datesData\s*=\s*JSON\.parse\('(.+?)'\)", html)
-        if m:
-            return json.loads(codecs.decode(m.group(1), "unicode_escape"))
-        errors.append("page: datesData not embedded")
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-        errors.append(f"page: {exc}")
-    try:
-        payload = json.loads(_get(API_URL.format(league=league, year=year), ajax=True))
-        return payload["dates"]
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError) as exc:
-        errors.append(f"api: {exc}")
-    raise XgSourceError(f"understat {league} {year}: " + "; ".join(errors))
 
 
 def fetch_season(code: str, season: str, cache_dir: Path) -> pd.DataFrame:
     """season '2324' -> understat year 2023. Cached as JSON; only finished matches are returned."""
-    league = UNDERSTAT_LEAGUES.get(code)
+    league = LEAGUES.get(code)
     if league is None:
-        raise XgSourceError(f"no understat league for {code}")
+        raise UnderstatError(f"no understat league for {code}")
     year = 2000 + int(season[:2])
     cache = cache_dir / f"understat_{code}_{season}.json"
     if cache.exists():
         dates = json.loads(cache.read_text())
     else:
-        dates = _parse_dates(league, year)
+        dates = league_dates(league, year)
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps(dates))
         log.info("downloaded understat %s %d (%d matches)", league, year, len(dates))
 
     rows = [{
+        "us_id": str(d["id"]),
         "date": pd.Timestamp(d["datetime"]).normalize(),
         "home": d["h"]["title"], "away": d["a"]["title"],
         "hg": int(d["goals"]["h"]), "ag": int(d["goals"]["a"]),
@@ -109,10 +72,11 @@ def attach_xg(matches: pd.DataFrame, code: str, cache_dir: Path) -> pd.DataFrame
     for season in matches["season"].unique():
         try:
             frames.append(fetch_season(code, season, cache_dir))
-        except XgSourceError as exc:
+        except UnderstatError as exc:
             log.warning("%s", exc)
     out = matches.copy()
     out[["hxg", "axg"]] = float("nan")
+    out["us_id"] = pd.Series(pd.NA, index=out.index, dtype="string")
     if not frames:
         return out
 
@@ -126,5 +90,6 @@ def attach_xg(matches: pd.DataFrame, code: str, cache_dir: Path) -> pd.DataFrame
     merged = merged[(merged["date"] - merged["date_xg"]).abs() <= pd.Timedelta(days=3)]
     out.loc[merged["index"], "hxg"] = merged["hxg_xg"].to_numpy()
     out.loc[merged["index"], "axg"] = merged["axg_xg"].to_numpy()
+    out.loc[merged["index"], "us_id"] = merged["us_id_xg"].to_numpy()
     log.info("xG attached to %d/%d matches", out["hxg"].notna().sum(), len(out))
     return out
