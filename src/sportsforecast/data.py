@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 log = logging.getLogger(__name__)
@@ -109,12 +110,20 @@ def read_csv(path: Path) -> pd.DataFrame:
 def _first_complete(raw: pd.DataFrame, candidates: list[tuple[str, ...]],
                     min_coverage: float = 0.9) -> tuple[str, ...] | None:
     for cols in candidates:
-        if all(c in raw.columns for c in cols) and raw[list(cols)].notna().all(axis=1).mean() >= min_coverage:
+        if all(c in raw.columns for c in cols) and \
+                pd.notna(_numeric(raw, cols)).all(axis=1).mean() >= min_coverage:
             return cols
     return None
 
 
+def _numeric(raw: pd.DataFrame, cols: tuple[str, ...]) -> np.ndarray:
+    """Some files carry placeholders such as '#' in price cells; those become NaN (missing)."""
+    return raw[list(cols)].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+
+
 def _normalize(raw: pd.DataFrame, season: str) -> pd.DataFrame:
+    raw = raw.assign(FTHG=pd.to_numeric(raw["FTHG"], errors="coerce"),
+                     FTAG=pd.to_numeric(raw["FTAG"], errors="coerce"))
     raw = raw.dropna(subset=["HomeTeam", "AwayTeam", "FTHG", "FTAG"])
     df = pd.DataFrame({
         # Official files use dd/mm/yy(yy), the mirror uses ISO dates
@@ -129,25 +138,25 @@ def _normalize(raw: pd.DataFrame, season: str) -> pd.DataFrame:
     opening = _first_complete(raw, OPENING_ODDS)
     closing = _first_complete(raw, CLOSING_ODDS)
     if closing:
-        df[["odds_h", "odds_d", "odds_a"]] = raw[list(closing)].to_numpy(dtype=float)
+        df[["odds_h", "odds_d", "odds_a"]] = _numeric(raw, closing)
         df["odds_source"] = closing[0]
         if opening:
-            df[["open_h", "open_d", "open_a"]] = raw[list(opening)].to_numpy(dtype=float)
+            df[["open_h", "open_d", "open_a"]] = _numeric(raw, opening)
     elif opening:
         # No closing prices (older seasons): opening odds become the market benchmark, no CLV possible
-        df[["odds_h", "odds_d", "odds_a"]] = raw[list(opening)].to_numpy(dtype=float)
+        df[["odds_h", "odds_d", "odds_a"]] = _numeric(raw, opening)
         df["odds_source"] = opening[0]
     ou_open, ou_close = _first_complete(raw, OU_OPENING), _first_complete(raw, OU_CLOSING)
     if ou_close:
-        df[["ou_over", "ou_under"]] = raw[list(ou_close)].to_numpy(dtype=float)
+        df[["ou_over", "ou_under"]] = _numeric(raw, ou_close)
         if ou_open:
-            df[["ou_open_over", "ou_open_under"]] = raw[list(ou_open)].to_numpy(dtype=float)
+            df[["ou_open_over", "ou_open_under"]] = _numeric(raw, ou_open)
     elif ou_open:
-        df[["ou_over", "ou_under"]] = raw[list(ou_open)].to_numpy(dtype=float)
+        df[["ou_over", "ou_under"]] = _numeric(raw, ou_open)
     for book in BOOKMAKERS:
         cols = (f"{book}CH", f"{book}CD", f"{book}CA")
         if _first_complete(raw, [cols], min_coverage=0.5):
-            df[[f"book_{book}_h", f"book_{book}_d", f"book_{book}_a"]] = raw[list(cols)].to_numpy(dtype=float)
+            df[[f"book_{book}_h", f"book_{book}_d", f"book_{book}_a"]] = _numeric(raw, cols)
     return df
 
 

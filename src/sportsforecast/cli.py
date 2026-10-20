@@ -31,7 +31,7 @@ MODEL_ORDER = ["elo", "dc", "dcx", "dcl", "ens", "blend", "open", "cons", "mkt",
 def _load(args: argparse.Namespace) -> pd.DataFrame | None:
     try:
         matches = load_league(args.league, expand_seasons(args.seasons), Path(args.data_dir))
-    except DataSourceError as exc:
+    except (DataSourceError, ValueError, KeyError) as exc:
         print(exc, file=sys.stderr)
         return None
     if args.xg or getattr(args, "lineups", False):
@@ -162,7 +162,11 @@ def cmd_compare(args: argparse.Namespace) -> int:
             print(f"{league}: skipped (data unavailable)", file=sys.stderr)
             continue
         cfg = backtest.BacktestConfig(burn_in_seasons=args.burn_in)
-        rows.append(_summary_row(league, backtest.run(matches, cfg), args.min_edge))
+        try:
+            rows.append(_summary_row(league, backtest.run(matches, cfg), args.min_edge))
+        except (ValueError, KeyError) as exc:
+            print(f"{league}: skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
+            continue
         print(f"{league}: done")
     table = pd.DataFrame(rows).set_index("league")
     print("\ngap_* > 0: market better; model_w_*: weight the stack gives the models next to the closing "
@@ -186,7 +190,11 @@ def cmd_strategy(args: argparse.Namespace) -> int:
         if matches is None:
             print(f"{league}: skipped (data unavailable)", file=sys.stderr)
             continue
-        per_league[league] = backtest.run(matches, backtest.BacktestConfig(burn_in_seasons=args.burn_in)).preds
+        try:
+            per_league[league] = backtest.run(matches, backtest.BacktestConfig(burn_in_seasons=args.burn_in)).preds
+        except (ValueError, KeyError) as exc:
+            print(f"{league}: skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
+            continue
         print(f"{league}: backtest done")
     pooled, by_league = strategy.evaluate(per_league, rules, args.validation_seasons)
 
