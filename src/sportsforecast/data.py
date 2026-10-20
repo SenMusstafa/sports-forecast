@@ -21,6 +21,10 @@ LEAGUES = {
     "F1": "ligue-1",
 }
 
+# Every football-data.co.uk main league with match odds
+MAIN_LEAGUES = ["E0", "E1", "E2", "E3", "EC", "SC0", "SC1", "SC2", "SC3", "D1", "D2", "I1", "I2",
+                "SP1", "SP2", "F1", "F2", "N1", "B1", "P1", "T1", "G1"]
+
 OFFICIAL_URL = "https://www.football-data.co.uk/mmz4281/{season}/{code}.csv"
 MIRROR_URL = "https://raw.githubusercontent.com/datasets/football-datasets/main/datasets/{slug}/season-{season}.csv"
 

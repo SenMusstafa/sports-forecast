@@ -94,6 +94,9 @@ def build_team_mapping(left: pd.DataFrame, right: pd.DataFrame, tolerance_days: 
 
 def attach_xg(matches: pd.DataFrame, code: str, cache_dir: Path) -> pd.DataFrame:
     """Add hxg/axg columns; seasons that cannot be fetched keep NaN so the pipeline degrades gracefully."""
+    if code not in LEAGUES:  # Understat covers only the big five leagues
+        return matches.assign(hxg=float("nan"), axg=float("nan"),
+                              us_id=pd.Series(pd.NA, index=matches.index, dtype="string"))
     frames = []
     for season in matches["season"].unique():
         try:

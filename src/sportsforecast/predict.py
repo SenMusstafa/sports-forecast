@@ -111,13 +111,15 @@ def _blend_weights(result: backtest.BacktestResult) -> dict[str, float]:
     return w
 
 
-def forecast(history: pd.DataFrame, fixtures: pd.DataFrame, cfg: BacktestConfig | None = None) -> ForecastResult:
+def forecast(history: pd.DataFrame, fixtures: pd.DataFrame, cfg: BacktestConfig | None = None,
+             result: backtest.BacktestResult | None = None) -> ForecastResult:
+    """`result` may pass a backtest already run on the same history (it must not include the fixtures)."""
     cfg = cfg or BacktestConfig()
     as_of = fixtures["date"].min()
     history = history[history["date"] < as_of].reset_index(drop=True)
 
     # 1) Walk-forward backtest on history: blend weights + honest accuracy context for the report
-    result = backtest.run(history, cfg)
+    result = result or backtest.run(history, cfg)
     weights = _blend_weights(result)
     beta = result.pool_weights.get("lineup_beta")
     validation = evaluate(result.preds, ["blend", "mkt"], common=True)
@@ -136,7 +138,8 @@ def forecast(history: pd.DataFrame, fixtures: pd.DataFrame, cfg: BacktestConfig 
 
     rows = []
     for f in fixtures.itertuples(index=False):
-        probs = {"elo": logit.predict(np.array([elo.diff(f.home, f.away)]))[0]}
+        elo_diff = elo.diff(f.home, f.away)
+        probs = {"elo": logit.predict(np.array([elo_diff]))[0]}
         p_dc = dc.predict(f.home, f.away)
         probs["dc"] = np.array([p_dc["H"], p_dc["D"], p_dc["A"]])
         lam, mu = goal_model.rates(f.home, f.away)
@@ -149,7 +152,7 @@ def forecast(history: pd.DataFrame, fixtures: pd.DataFrame, cfg: BacktestConfig 
 
         top = np.dstack(np.unravel_index(np.argsort(mat, axis=None)[::-1][:3], mat.shape))[0]
         rows.append({
-            "date": f.date, "time": f.time, "home": f.home, "away": f.away,
+            "date": f.date, "time": f.time, "home": f.home, "away": f.away, "elo_diff": elo_diff,
             "model_H": model[0], "model_D": model[1], "model_A": model[2],
             "xg_home": lam, "xg_away": mu, "over25": mk["over25"], "btts": mk["btts"],
             "top_scores": ", ".join(f"{h}-{a} ({mat[h, a]:.0%})" for h, a in top),

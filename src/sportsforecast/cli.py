@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import backtest, clv, metrics, players, predict, report, strategy, tuning, understat, xg
-from .data import OFFICIAL_URL, current_season
+from . import backtest, clv, draws, metrics, players, predict, report, strategy, tuning, understat, xg
+from .data import MAIN_LEAGUES, OFFICIAL_URL, current_season
 from .understat import UnderstatError
 from .data import DataSourceError, load_league
 
@@ -214,6 +214,126 @@ def cmd_strategy(args: argparse.Namespace) -> int:
     by_league.to_csv(out / "strategy_by_league.csv")
     print(f"\nsaved {out}/strategy_*.csv")
     return 0
+
+
+def _draw_history(args: argparse.Namespace, before: pd.Timestamp | None = None) -> tuple[pd.DataFrame, dict]:
+    """Walk-forward backtest of every league (only matches before `before`), as pooled draw features."""
+    leagues = MAIN_LEAGUES if args.leagues.lower() == "all" else args.leagues.split(",")
+    feats, per_league = [], {}
+    for league in leagues:
+        args.league = league
+        matches = _load(args)
+        if matches is None:
+            print(f"{league}: skipped (data unavailable)", file=sys.stderr)
+            continue
+        history = matches if before is None else matches[matches["date"] < before].reset_index(drop=True)
+        try:
+            result = backtest.run(history, backtest.BacktestConfig(burn_in_seasons=args.burn_in))
+        except (ValueError, KeyError) as exc:
+            print(f"{league}: skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
+            continue
+        per_league[league] = (matches, history, result)
+        feats.append(draws.features(result.preds, league))
+        print(f"{league}: {len(result.preds)} matches")
+    return draws.add_league_draw_rate(pd.concat(feats, ignore_index=True)), per_league
+
+
+def cmd_draws_backtest(args: argparse.Namespace) -> int:
+    f, _ = _draw_history(args)
+    scored = draws.walk_forward(f)
+    seasons = sorted(scored["season"].unique())
+    valid = scored[scored["season"].isin(seasons[-args.validation_seasons:])]
+    ns = tuple(int(n) for n in args.top.split(","))
+    print(f"\n{scored['league'].nunique()} leagues, {len(scored)} matches scored walk-forward "
+          f"({scored['week'].nunique()} weeks). Lists are the top-N matches of each week across all leagues.\n")
+    for label, part in (("All scored seasons", scored), (f"Validation seasons {seasons[-args.validation_seasons:]}", valid)):
+        print(f"=== {label} ===")
+        print(draws.evaluate(part, ns).round(4).to_string(), "\n")
+        print(draws.binary_scores(part).round(5).to_string(), "\n")
+    model = draws.DrawModel(draws.FEATURES).fit(draws.usable(f), draws.usable(f)["draw"].to_numpy())
+    print("Combined model, standardised weights (fit on all data, for interpretation only):")
+    print(", ".join(f"{k}={v:+.3f}" for k, v in model.weights().items()))
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    scored.to_csv(out / "draws_backtest.csv", index=False)
+    print(f"\nsaved {out}/draws_backtest.csv")
+    return 0
+
+
+def cmd_draws_list(args: argparse.Namespace) -> int:
+    """Everything is frozen at --as-of: models, draw model and league rates see only earlier matches.
+
+    A past --as-of replays the window exactly as a list made that morning (opening odds as prices),
+    then shows the results; a current --as-of uses fixtures.csv.
+    """
+    as_of = pd.Timestamp(args.as_of) if args.as_of else pd.Timestamp.today().normalize()
+    end = as_of + pd.Timedelta(days=args.days)
+    past = as_of < pd.Timestamp.today().normalize()
+    if args.seasons is None:
+        args.seasons = f"1819-{current_season(as_of)}"
+    f, per_league = _draw_history(args, before=as_of)
+
+    rows, played_rows = [], []
+    for league, (matches, history, result) in per_league.items():
+        if past:
+            fixtures, played = predict.past_fixtures(matches, as_of, args.days)
+        else:
+            try:
+                fixtures = predict.fetch_fixtures(league, Path(args.data_dir))
+            except DataSourceError as exc:
+                print(f"fixtures: {exc}", file=sys.stderr)
+                return 2
+            fixtures = fixtures[(fixtures["date"] >= as_of) & (fixtures["date"] < end)].reset_index(drop=True)
+        if fixtures.empty or "odds_h" not in fixtures:
+            continue
+        cfg = backtest.BacktestConfig(burn_in_seasons=args.burn_in)
+        table = predict.forecast(history, fixtures, cfg, result).table
+        table["odds_d"] = fixtures["odds_d"].to_numpy()
+        rows.append(draws.fixture_features(table, league))
+        if past:
+            played_rows.append(played.assign(league=league)[["league", "home", "away", "date", "hg", "ag", "result"]])
+    if not rows:
+        print(f"no fixtures with odds between {as_of:%Y-%m-%d} and {end:%Y-%m-%d}"
+              + ("" if past else f" (fixtures.csv leagues: {', '.join(predict.fixture_leagues(Path(args.data_dir)))})"),
+              file=sys.stderr)
+        return 1
+
+    window = pd.concat(rows, ignore_index=True)
+    combined = draws.add_league_draw_rate(pd.concat([f, window], ignore_index=True))
+    history_f, window = draws.usable(combined[combined["draw"].notna()]), combined[combined["draw"].isna()].copy()
+    window = window.dropna(subset=["market_D"])
+    window["p_combined"] = draws.DrawModel(draws.FEATURES).fit(history_f, history_f["draw"].to_numpy()).predict(window)
+    window["p_market"] = draws.DrawModel(draws.MARKET_ONLY).fit(history_f, history_f["draw"].to_numpy()).predict(window)
+    cols = ["date", "time", "league", "home", "away", "market_D", "p_combined", "draw_odds"]
+    picks = window.nlargest(args.top, "p_combined")
+    print(f"\nTop {args.top} draw candidates {as_of:%Y-%m-%d}..{end:%Y-%m-%d} of {len(window)} matches "
+          f"(everything fitted on data before {as_of:%Y-%m-%d}):")
+
+    if past:
+        results = pd.concat(played_rows, ignore_index=True)
+        results["score"] = results["hg"].astype(int).astype(str) + "-" + results["ag"].astype(int).astype(str)
+        picks = picks.drop(columns=["draw", "score"], errors="ignore").merge(results[["league", "home", "away", "score", "result"]],
+                                                   on=["league", "home", "away"], how="left")
+        picks["draw"] = (picks["result"] == "D").astype(int)
+        print(picks[cols + ["score"]].to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+        market_picks = window.nlargest(args.top, "p_market").merge(results, on=["league", "home", "away"])
+        print(f"\ndraws in list: {picks['draw'].sum()}/{len(picks)} (expected {picks['p_combined'].sum():.2f}); "
+              f"market-only list: {(market_picks['result'] == 'D').sum()}/{len(market_picks)}; "
+              f"all {len(results)} matches: {(results['result'] == 'D').mean():.1%} draws")
+        print("One window says little: the hit count of a 5-7 match list swings by ±1-2 draws by chance.")
+    else:
+        print(picks[cols].to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+        print(f"\nexpected draws in the list: {picks['p_combined'].sum():.2f} of {len(picks)}")
+    _save_draw_list(args, picks, as_of)
+    return 0
+
+
+def _save_draw_list(args: argparse.Namespace, picks: pd.DataFrame, as_of: pd.Timestamp) -> None:
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / f"draws_{as_of:%Y%m%d}.csv"
+    picks.to_csv(path, index=False)
+    print(f"saved {path}")
 
 
 def cmd_tune(args: argparse.Namespace) -> int:
@@ -437,6 +557,25 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--validation-seasons", type=int, default=2, help="last N seasons held out for validation")
     st.add_argument("--out-dir", default="reports")
     st.set_defaults(func=cmd_strategy)
+
+    dr = sub.add_parser("draws", help="rank matches by draw probability (market + models + history)")
+    dsub = dr.add_subparsers(dest="draws_command", required=True)
+    db = dsub.add_parser("backtest", help="weekly top-N draw lists over past seasons, all leagues pooled")
+    _add_data_args(db)
+    db.add_argument("--leagues", default="all", help="'all' or comma list of football-data codes")
+    db.add_argument("--top", default="3,5,7")
+    db.add_argument("--validation-seasons", type=int, default=2)
+    db.add_argument("--out-dir", default="reports")
+    db.set_defaults(func=cmd_draws_backtest)
+    dl = dsub.add_parser("list", help="top draw candidates for a window (past: with results; future: fixtures)")
+    _add_data_args(dl)
+    dl.set_defaults(seasons=None)
+    dl.add_argument("--leagues", default="all")
+    dl.add_argument("--as-of", help="YYYY-MM-DD, default today")
+    dl.add_argument("--days", type=int, default=7)
+    dl.add_argument("--top", type=int, default=7)
+    dl.add_argument("--out-dir", default="reports")
+    dl.set_defaults(func=cmd_draws_list)
 
     pr = sub.add_parser("predict", help="forecast upcoming fixtures and write an HTML report")
     _add_data_args(pr)
