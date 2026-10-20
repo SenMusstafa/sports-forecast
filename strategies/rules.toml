@@ -1,0 +1,58 @@
+# Pre-registered betting rules. Written before any rule was evaluated; do not edit thresholds
+# after looking at validation results (discovery-period tweaks must be committed as new rules).
+#
+# Each rule bets 1 unit at the OPENING price on `bet` when the pandas query `when` is true.
+# Available pre-match columns:
+#   exp_home, exp_away, exp_total, exp_gap   goal-model expectations (xG Dixon-Coles if available)
+#   model_H/D/A                              blended model 1X2 probabilities
+#   model25_O/U                              goal-model over/under 2.5 probabilities
+#   open_H/D/A, open25_O/U                   de-vigged opening market probabilities
+# Controls bet every match and show what the bookmaker margin alone costs.
+
+[[rule]]
+name = "control_all_draws"
+hypothesis = "Baseline: betting every draw loses roughly the margin."
+when = "exp_total > 0"
+bet = "D"
+
+[[rule]]
+name = "draw_low_total_balanced"
+hypothesis = "Two low-scoring, evenly matched sides draw more often than the market prices."
+when = "exp_total < 2.3 and exp_gap < 0.35"
+bet = "D"
+
+[[rule]]
+name = "draw_market_tight_low"
+hypothesis = "Market itself expects few goals and a close game; draw still underpriced."
+when = "open25_U >= 0.55 and abs(open_H - open_A) < 0.15"
+bet = "D"
+
+[[rule]]
+name = "draw_model_above_market"
+hypothesis = "Where the model's draw probability exceeds the market's by 3+ points, the draw is underpriced."
+when = "model_D - open_D >= 0.03"
+bet = "D"
+
+[[rule]]
+name = "draw_low_total_and_model_gap"
+hypothesis = "Combination: low expected total and the model rates the draw above the market."
+when = "exp_total < 2.5 and model_D - open_D >= 0.02"
+bet = "D"
+
+[[rule]]
+name = "control_all_unders"
+hypothesis = "Baseline: betting every under 2.5 loses roughly the margin."
+when = "exp_total > 0"
+bet = "U"
+
+[[rule]]
+name = "under_low_total"
+hypothesis = "Low expected total from xG: under 2.5 is underpriced."
+when = "exp_total < 2.3"
+bet = "U"
+
+[[rule]]
+name = "under_model_above_market"
+hypothesis = "Where the xG model's under probability exceeds the market's by 4+ points, under is underpriced."
+when = "model25_U - open25_U >= 0.04"
+bet = "U"
