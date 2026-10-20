@@ -73,6 +73,11 @@ def fetch_fixtures(code: str, cache_dir: Path, max_age_hours: float = 3.0) -> pd
     return df.sort_values(["date", "time"]).reset_index(drop=True)
 
 
+def fixture_leagues(cache_dir: Path) -> list[str]:
+    path = cache_dir / "fixtures.csv"
+    return sorted(read_csv(path)["Div"].dropna().unique()) if path.exists() else []
+
+
 @dataclass
 class ForecastResult:
     table: pd.DataFrame

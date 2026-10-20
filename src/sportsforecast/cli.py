@@ -198,10 +198,16 @@ def cmd_predict(args: argparse.Namespace) -> int:
     except DataSourceError as exc:
         print(exc, file=sys.stderr)
         return 2
-    fixtures = fixtures[(fixtures["date"] >= as_of) & (fixtures["date"] < as_of + pd.Timedelta(days=args.days))]
-    if fixtures.empty:
-        print(f"no {args.league} fixtures in the next {args.days} days from {as_of:%Y-%m-%d}", file=sys.stderr)
+    window = fixtures[(fixtures["date"] >= as_of) & (fixtures["date"] < as_of + pd.Timedelta(days=args.days))]
+    if window.empty:
+        span = (f"{len(fixtures)} {args.league} fixtures dated {fixtures['date'].min():%Y-%m-%d}.."
+                f"{fixtures['date'].max():%Y-%m-%d}" if len(fixtures) else f"no {args.league} fixtures at all")
+        print(f"no {args.league} fixtures in the next {args.days} days from {as_of:%Y-%m-%d}; "
+              f"fixtures.csv has {span} (leagues: {', '.join(predict.fixture_leagues(Path(args.data_dir)))}). "
+              f"The file is refreshed when older than 3h; delete data/raw/fixtures.csv to force it.",
+              file=sys.stderr)
         return 1
+    fixtures = window
     fixtures = fixtures.reset_index(drop=True)
     print(f"{args.league}: history {args.seasons} ({len(history)} matches), {len(fixtures)} fixtures")
 
