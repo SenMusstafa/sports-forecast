@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import backtest, clv, metrics, players, predict, report, tuning, understat, xg
+from . import backtest, clv, metrics, players, predict, report, strategy, tuning, understat, xg
 from .data import OFFICIAL_URL, current_season
 from .understat import UnderstatError
 from .data import DataSourceError, load_league
@@ -174,6 +174,37 @@ def cmd_compare(args: argparse.Namespace) -> int:
     path = out / f"compare_{seasons[0]}_{seasons[-1]}.csv"
     table.to_csv(path)
     print(f"\nsaved {path}")
+    return 0
+
+
+def cmd_strategy(args: argparse.Namespace) -> int:
+    rules = strategy.load_rules(Path(args.rules))
+    per_league = {}
+    for league in args.leagues.split(","):
+        args.league = league
+        matches = _load(args)
+        if matches is None:
+            print(f"{league}: skipped (data unavailable)", file=sys.stderr)
+            continue
+        per_league[league] = backtest.run(matches, backtest.BacktestConfig(burn_in_seasons=args.burn_in)).preds
+        print(f"{league}: backtest done")
+    pooled, by_league = strategy.evaluate(per_league, rules, args.validation_seasons)
+
+    # Each rule is tested in two periods; a Bonferroni bar keeps chance findings out
+    alpha = 0.05 / max(len(rules), 1)
+    validation = pooled.index.get_level_values("period") == "validation"
+    pooled["promising"] = validation & (pooled.get("clv", 0) > 0) & (pooled.get("clv_p", 1) < alpha)
+    print(f"\n{len(rules)} pre-registered rules from {args.rules}. Bets at opening odds, 1 unit each.")
+    print("hit vs implied: actual frequency vs de-vigged opening probability; clv: mean closing-line value; "
+          f"a rule is only promising if validation clv > 0 with clv_p < {alpha:.4f} (0.05 / rules)\n")
+    print(pooled.round(4).to_string(), "\n")
+    print("Validation period by league:")
+    print(by_league.round(4).to_string())
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    pooled.to_csv(out / "strategy_pooled.csv")
+    by_league.to_csv(out / "strategy_by_league.csv")
+    print(f"\nsaved {out}/strategy_*.csv")
     return 0
 
 
@@ -390,6 +421,14 @@ def main(argv: list[str] | None = None) -> int:
     cp.add_argument("--min-edge", type=float, default=0.03)
     cp.add_argument("--out-dir", default="reports")
     cp.set_defaults(func=cmd_compare)
+
+    st = sub.add_parser("strategy", help="evaluate pre-registered betting rules (strategies/rules.toml)")
+    _add_data_args(st)
+    st.add_argument("--leagues", default="E0,SP1,I1,D1,F1")
+    st.add_argument("--rules", default="strategies/rules.toml")
+    st.add_argument("--validation-seasons", type=int, default=2, help="last N seasons held out for validation")
+    st.add_argument("--out-dir", default="reports")
+    st.set_defaults(func=cmd_strategy)
 
     pr = sub.add_parser("predict", help="forecast upcoming fixtures and write an HTML report")
     _add_data_args(pr)
