@@ -31,7 +31,11 @@ def accuracy(p: np.ndarray, y: np.ndarray) -> float:
     return float(np.mean(p.argmax(axis=1) == y.argmax(axis=1)))
 
 
-def evaluate(preds: pd.DataFrame, models: list[str]) -> pd.DataFrame:
+def evaluate(preds: pd.DataFrame, models: list[str], common: bool = False) -> pd.DataFrame:
+    """common=True scores every model on the same rows (where all of them have a forecast)."""
+    models = [m for m in models if f"{m}_H" in preds]
+    if common:
+        preds = preds.dropna(subset=[f"{m}_{o}" for m in models for o in "HDA"])
     rows = []
     for m in models:
         cols = [f"{m}_H", f"{m}_D", f"{m}_A"]
@@ -43,7 +47,7 @@ def evaluate(preds: pd.DataFrame, models: list[str]) -> pd.DataFrame:
             "model": m, "n": len(sub), "log_loss": log_loss(p, y), "brier": brier(p, y),
             "rps": rps(p, y), "accuracy": accuracy(p, y),
         })
-    return pd.DataFrame(rows).set_index("model")
+    return pd.DataFrame(rows, columns=["model", "n", "log_loss", "brier", "rps", "accuracy"]).set_index("model")
 
 
 def calibration(preds: pd.DataFrame, model: str, bins: int = 10) -> pd.DataFrame:

@@ -22,13 +22,20 @@ LEAGUES = {
 OFFICIAL_URL = "https://www.football-data.co.uk/mmz4281/{season}/{code}.csv"
 MIRROR_URL = "https://raw.githubusercontent.com/datasets/football-datasets/main/datasets/{slug}/season-{season}.csv"
 
-# Preference order: Pinnacle closing > market average closing > Pinnacle opening > Bet365
-ODDS_COLUMNS = [
+# Closing odds preference: Pinnacle > market average > Bet365. Seasons before 2019/20 have no closing columns.
+CLOSING_ODDS = [
     ("PSCH", "PSCD", "PSCA"),
     ("AvgCH", "AvgCD", "AvgCA"),
+    ("B365CH", "B365CD", "B365CA"),
+]
+# "Opening" in football-data terms = odds collected a few days before kick-off
+OPENING_ODDS = [
     ("PSH", "PSD", "PSA"),
+    ("AvgH", "AvgD", "AvgA"),
     ("B365H", "B365D", "B365A"),
 ]
+# Individual bookmakers' closing prices used for the multi-book consensus
+BOOKMAKERS = ["B365", "BW", "IW", "PS", "WH", "VC", "1XB", "BF"]
 
 RESULT_COLUMNS = ["date", "season", "home", "away", "hg", "ag", "result"]
 
@@ -65,6 +72,14 @@ def fetch_season(code: str, season: str, cache_dir: Path) -> Path:
     raise DataSourceError(f"{code} {season} could not be fetched:\n  " + "\n  ".join(errors))
 
 
+def _first_complete(raw: pd.DataFrame, candidates: list[tuple[str, str, str]],
+                    min_coverage: float = 0.9) -> tuple[str, str, str] | None:
+    for cols in candidates:
+        if all(c in raw.columns for c in cols) and raw[list(cols)].notna().all(axis=1).mean() >= min_coverage:
+            return cols
+    return None
+
+
 def _normalize(raw: pd.DataFrame, season: str) -> pd.DataFrame:
     raw = raw.dropna(subset=["HomeTeam", "AwayTeam", "FTHG", "FTAG"])
     df = pd.DataFrame({
@@ -77,11 +92,21 @@ def _normalize(raw: pd.DataFrame, season: str) -> pd.DataFrame:
         "ag": raw["FTAG"].astype(int),
         "result": raw["FTR"].str.strip(),
     })
-    for cols in ODDS_COLUMNS:
-        if all(c in raw.columns for c in cols) and raw[list(cols)].notna().all(axis=1).mean() > 0.9:
-            df[["odds_h", "odds_d", "odds_a"]] = raw[list(cols)].to_numpy(dtype=float)
-            df["odds_source"] = cols[0]
-            break
+    opening = _first_complete(raw, OPENING_ODDS)
+    closing = _first_complete(raw, CLOSING_ODDS)
+    if closing:
+        df[["odds_h", "odds_d", "odds_a"]] = raw[list(closing)].to_numpy(dtype=float)
+        df["odds_source"] = closing[0]
+        if opening:
+            df[["open_h", "open_d", "open_a"]] = raw[list(opening)].to_numpy(dtype=float)
+    elif opening:
+        # No closing prices (older seasons): opening odds become the market benchmark, no CLV possible
+        df[["odds_h", "odds_d", "odds_a"]] = raw[list(opening)].to_numpy(dtype=float)
+        df["odds_source"] = opening[0]
+    for book in BOOKMAKERS:
+        cols = (f"{book}CH", f"{book}CD", f"{book}CA")
+        if _first_complete(raw, [cols], min_coverage=0.5):
+            df[[f"book_{book}_h", f"book_{book}_d", f"book_{book}_a"]] = raw[list(cols)].to_numpy(dtype=float)
     return df
 
 
