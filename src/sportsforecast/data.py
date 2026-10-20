@@ -72,6 +72,15 @@ def fetch_season(code: str, season: str, cache_dir: Path) -> Path:
     raise DataSourceError(f"{code} {season} could not be fetched:\n  " + "\n  ".join(errors))
 
 
+def read_csv(path: Path) -> pd.DataFrame:
+    """football-data CSVs: some start with a UTF-8 BOM, older ones are latin-1."""
+    raw = path.read_bytes()
+    text_encoding = "utf-8-sig" if raw.startswith(b"\xef\xbb\xbf") else "latin-1"
+    df = pd.read_csv(path, encoding=text_encoding)
+    df.columns = df.columns.str.strip()
+    return df
+
+
 def _first_complete(raw: pd.DataFrame, candidates: list[tuple[str, str, str]],
                     min_coverage: float = 0.9) -> tuple[str, str, str] | None:
     for cols in candidates:
@@ -114,6 +123,6 @@ def load_league(code: str, seasons: list[str], cache_dir: Path) -> pd.DataFrame:
     frames = []
     for season in seasons:
         path = fetch_season(code, season, cache_dir)
-        frames.append(_normalize(pd.read_csv(path, encoding="latin-1"), season))
+        frames.append(_normalize(read_csv(path), season))
     df = pd.concat(frames, ignore_index=True).sort_values("date", kind="stable").reset_index(drop=True)
     return df

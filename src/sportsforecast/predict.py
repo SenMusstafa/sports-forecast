@@ -18,7 +18,7 @@ import pandas as pd
 
 from . import backtest
 from .backtest import BacktestConfig
-from .data import DataSourceError
+from .data import DataSourceError, read_csv
 from .dixon_coles import DixonColes, markets, score_matrix
 from .elo import Elo, OrderedLogit
 from .metrics import OUTCOME_INDEX, evaluate
@@ -50,7 +50,10 @@ def fetch_fixtures(code: str, cache_dir: Path, max_age_hours: float = 3.0) -> pd
                 raise DataSourceError(f"fixtures: {exc}") from exc
             log.warning("fixtures refresh failed (%s), using cached copy", exc)
 
-    raw = pd.read_csv(path, encoding="latin-1")
+    raw = read_csv(path)
+    if "Div" not in raw.columns:
+        path.unlink()  # likely an error page instead of the CSV; force a fresh download next time
+        raise DataSourceError(f"fixtures: unexpected format, first columns {list(raw.columns[:5])}")
     raw = raw[raw["Div"] == code]
     df = pd.DataFrame({
         "date": pd.to_datetime(raw["Date"], dayfirst=True, format="mixed"),
