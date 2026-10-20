@@ -9,30 +9,34 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .metrics import ONE_X_TWO, Market
 
-def bets(preds: pd.DataFrame, model: str, min_edge: float = 0.03) -> pd.DataFrame:
+
+def bets(preds: pd.DataFrame, model: str, min_edge: float = 0.03, market: Market = ONE_X_TWO) -> pd.DataFrame:
     """Flat 1-unit bets at opening odds where the model sees edge >= min_edge."""
-    required = {"open_h", "mkt_H", f"{model}_H"}
+    required = {market.open_odds[0], *market.cols(market.close_prob), *market.cols(model)}
     if not required <= set(preds.columns):
         return pd.DataFrame()
     rows = []
-    for o, side in zip("HDA", "hda"):
-        price = preds[f"open_{side}"]
+    for o, open_col, close_col in zip(market.outcomes, market.open_odds, market.close_odds):
+        price = preds[open_col]
+        close_p = preds[f"{market.close_prob}_{o}"]
         edge = preds[f"{model}_{o}"] * price - 1
-        sel = preds[(edge >= min_edge) & price.notna() & preds[f"mkt_{o}"].notna()]
+        sel = preds[(edge >= min_edge) & price.notna() & close_p.notna()]
         rows.append(pd.DataFrame({
             "date": sel["date"], "home": sel["home"], "away": sel["away"], "pick": o,
-            "open_odds": sel[f"open_{side}"], "close_odds": sel[f"odds_{side}"],
-            "edge": edge.loc[sel.index], "clv": sel[f"open_{side}"] * sel[f"mkt_{o}"] - 1,
-            "profit": np.where(sel["result"] == o, sel[f"open_{side}"] - 1, -1.0),
+            "open_odds": sel[open_col], "close_odds": sel[close_col],
+            "edge": edge.loc[sel.index], "clv": sel[open_col] * close_p.loc[sel.index] - 1,
+            "profit": np.where(sel[market.result_col] == o, sel[open_col] - 1, -1.0),
         }))
     return pd.concat(rows).sort_values("date").reset_index(drop=True)
 
 
-def summary(preds: pd.DataFrame, models: list[str], min_edge: float = 0.03) -> pd.DataFrame:
+def summary(preds: pd.DataFrame, models: list[str], min_edge: float = 0.03,
+            market: Market = ONE_X_TWO) -> pd.DataFrame:
     rows = []
     for m in models:
-        b = bets(preds, m, min_edge)
+        b = bets(preds, m, min_edge, market)
         if b.empty:
             continue
         rows.append({

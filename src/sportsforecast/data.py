@@ -35,6 +35,9 @@ OPENING_ODDS = [
     ("AvgH", "AvgD", "AvgA"),
     ("B365H", "B365D", "B365A"),
 ]
+# Over/Under 2.5 goals: (over, under) odds, same preference order
+OU_CLOSING = [("PC>2.5", "PC<2.5"), ("AvgC>2.5", "AvgC<2.5"), ("B365C>2.5", "B365C<2.5")]
+OU_OPENING = [("P>2.5", "P<2.5"), ("Avg>2.5", "Avg<2.5"), ("B365>2.5", "B365<2.5")]
 # Individual bookmakers' closing prices used for the multi-book consensus
 BOOKMAKERS = ["B365", "BW", "IW", "PS", "WH", "VC", "1XB", "BF"]
 
@@ -103,8 +106,8 @@ def read_csv(path: Path) -> pd.DataFrame:
     return df
 
 
-def _first_complete(raw: pd.DataFrame, candidates: list[tuple[str, str, str]],
-                    min_coverage: float = 0.9) -> tuple[str, str, str] | None:
+def _first_complete(raw: pd.DataFrame, candidates: list[tuple[str, ...]],
+                    min_coverage: float = 0.9) -> tuple[str, ...] | None:
     for cols in candidates:
         if all(c in raw.columns for c in cols) and raw[list(cols)].notna().all(axis=1).mean() >= min_coverage:
             return cols
@@ -134,6 +137,13 @@ def _normalize(raw: pd.DataFrame, season: str) -> pd.DataFrame:
         # No closing prices (older seasons): opening odds become the market benchmark, no CLV possible
         df[["odds_h", "odds_d", "odds_a"]] = raw[list(opening)].to_numpy(dtype=float)
         df["odds_source"] = opening[0]
+    ou_open, ou_close = _first_complete(raw, OU_OPENING), _first_complete(raw, OU_CLOSING)
+    if ou_close:
+        df[["ou_over", "ou_under"]] = raw[list(ou_close)].to_numpy(dtype=float)
+        if ou_open:
+            df[["ou_open_over", "ou_open_under"]] = raw[list(ou_open)].to_numpy(dtype=float)
+    elif ou_open:
+        df[["ou_over", "ou_under"]] = raw[list(ou_open)].to_numpy(dtype=float)
     for book in BOOKMAKERS:
         cols = (f"{book}CH", f"{book}CD", f"{book}CA")
         if _first_complete(raw, [cols], min_coverage=0.5):

@@ -88,6 +88,8 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         print(f"Bets at opening odds, edge >= {args.min_edge} (CLV vs de-vigged closing line):")
         print(bet_table.round(4).to_string(), "\n")
 
+    _print_totals(result, args.min_edge)
+
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     stem = f"{args.league}_{seasons[0]}_{seasons[-1]}"
@@ -96,6 +98,82 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     for name, history in result.pool_weights.items():
         history.to_csv(out / f"{stem}_{name}_weights.csv", index=False)
     print(f"saved {out / stem}_*.csv")
+    return 0
+
+
+TOTALS_ORDER = ["dc25", "dcx25", "blend25", "open25", "mkt25", "stack25_open", "stack25"]
+
+
+def _print_totals(result: backtest.BacktestResult, min_edge: float) -> None:
+    preds = result.preds
+    table = metrics.evaluate(preds, TOTALS_ORDER, common=True, market=metrics.TOTALS)
+    if table.empty:
+        return
+    print("=== Over/Under 2.5 ===")
+    print(table.drop(columns="rps").round(4).to_string(), "\n")
+    for name in ("blend25", "stack25", "stack25_open"):
+        history = result.pool_weights.get(name)
+        if history is not None and not history.empty:
+            last = history.iloc[-1].drop("date")
+            print(f"{name} weights (last refit): " + ", ".join(f"{k}={v:.2f}" for k, v in last.items()))
+    best = "dcx25" if "dcx25_O" in preds else "dc25"
+    print(f"\n{best} calibration (over 2.5):")
+    print(metrics.calibration(preds, best, market=metrics.TOTALS, outcome="O").round(3).to_string(), "\n")
+    bet_table = clv.summary(preds, [best, "blend25", "stack25_open"], min_edge, market=metrics.TOTALS)
+    if not bet_table.empty:
+        print(f"Over/Under bets at opening odds, edge >= {min_edge} (CLV vs de-vigged closing line):")
+        print(bet_table.round(4).to_string(), "\n")
+
+
+def _summary_row(league: str, result: backtest.BacktestResult, min_edge: float) -> dict:
+    """One line per league: how far the models are from the market and whether they add anything to it."""
+    preds, row = result.preds, {"league": league, "matches": len(result.preds)}
+    one = metrics.evaluate(preds, ["blend", "mkt"], common=True)
+    if {"blend", "mkt"} <= set(one.index):
+        row.update(blend_rps=one.loc["blend", "rps"], mkt_rps=one.loc["mkt", "rps"],
+                   gap_rps=one.loc["blend", "rps"] - one.loc["mkt", "rps"])
+    tot = metrics.evaluate(preds, ["blend25", "dcx25", "dc25", "mkt25"], common=True, market=metrics.TOTALS)
+    model25 = next((m for m in ("blend25", "dcx25", "dc25") if m in tot.index), None)
+    if model25 and "mkt25" in tot.index:
+        row.update(model25_brier=tot.loc[model25, "brier"], mkt25_brier=tot.loc["mkt25", "brier"],
+                   gap25_brier=tot.loc[model25, "brier"] - tot.loc["mkt25", "brier"])
+    for name, market_name, col in (("stack", "mkt", "model_w_1x2"), ("stack25", "mkt25", "model_w_ou")):
+        h = result.pool_weights.get(name)
+        if h is not None and not h.empty:
+            row[col] = 1 - h.iloc[-1][market_name]
+    for model, market, col in (("stack_open", metrics.ONE_X_TWO, "clv_1x2"),
+                               ("stack25_open", metrics.TOTALS, "clv_ou")):
+        b = clv.bets(preds, model, min_edge, market)
+        if not b.empty:
+            row[col], row[f"{col}_bets"] = b["clv"].mean(), len(b)
+    h = result.pool_weights.get("lineup_beta")
+    if h is not None and not h.empty:
+        row["lineup_beta"] = h.iloc[-1]["beta"]
+    return row
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    """Same frozen configuration on every league: consistency across leagues is the robustness test."""
+    rows = []
+    for league in args.leagues.split(","):
+        args.league = league
+        matches = _load(args)
+        if matches is None:
+            print(f"{league}: skipped (data unavailable)", file=sys.stderr)
+            continue
+        cfg = backtest.BacktestConfig(burn_in_seasons=args.burn_in)
+        rows.append(_summary_row(league, backtest.run(matches, cfg), args.min_edge))
+        print(f"{league}: done")
+    table = pd.DataFrame(rows).set_index("league")
+    print("\ngap_* > 0: market better; model_w_*: weight the stack gives the models next to the closing "
+          "market; clv_*: mean closing-line value of stack bets at opening odds\n")
+    print(table.round(4).to_string())
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    seasons = expand_seasons(args.seasons)
+    path = out / f"compare_{seasons[0]}_{seasons[-1]}.csv"
+    table.to_csv(path)
+    print(f"\nsaved {path}")
     return 0
 
 
@@ -194,6 +272,8 @@ def cmd_predict(args: argparse.Namespace) -> int:
     history = _load(args)
     if history is None:
         return 2
+    if as_of < pd.Timestamp.today().normalize():
+        return _predict_past(args, history, as_of)
     try:
         fixtures = predict.fetch_fixtures(args.league, Path(args.data_dir))
     except DataSourceError as exc:
@@ -224,22 +304,48 @@ def cmd_predict(args: argparse.Namespace) -> int:
     fixtures = fixtures.reset_index(drop=True)
     print(f"{args.league}: history {args.seasons} ({len(history)} matches), {len(fixtures)} fixtures")
 
+    result = predict.forecast(history, fixtures, _predict_config(args))
+    _save_forecast(args, result, as_of)
+    return 0
+
+
+def _predict_config(args: argparse.Namespace) -> backtest.BacktestConfig:
     cfg = backtest.BacktestConfig(burn_in_seasons=args.burn_in)
     if args.params:
         cfg = tuning.apply_params(cfg, tuning.load_params(Path(args.params)))
-    result = predict.forecast(history, fixtures, cfg)
+    return cfg
 
+
+def _predict_past(args: argparse.Namespace, history: pd.DataFrame, as_of: pd.Timestamp) -> int:
+    """Forecast an already played window as if it were upcoming, then score it."""
+    fixtures, played = predict.past_fixtures(history, as_of, args.days)
+    if fixtures.empty:
+        print(f"no played {args.league} matches between {as_of:%Y-%m-%d} and "
+              f"{as_of + pd.Timedelta(days=args.days):%Y-%m-%d}", file=sys.stderr)
+        return 1
+    print(f"{args.league}: past window {as_of:%Y-%m-%d} +{args.days}d, {len(fixtures)} played matches; "
+          f"models see only data before {fixtures['date'].min():%Y-%m-%d}, market = "
+          f"{fixtures['odds_source'].iloc[0] if 'odds_source' in fixtures else 'none'} odds")
+    result = predict.score_past(predict.forecast(history, fixtures, _predict_config(args)), played)
+    _save_forecast(args, result, as_of)
+    print(f"\nScores on these {len(fixtures)} matches (lower is better; one round is far too few "
+          f"to judge a model, the backtest is the real test):")
+    print(result.scores.round(4).to_string())
+    return 0
+
+
+def _save_forecast(args: argparse.Namespace, result: predict.ForecastResult, as_of: pd.Timestamp) -> None:
+    t = result.table
     cols = ["date", "home", "away", "model_H", "model_D", "model_A"] + \
-        [c for c in ("mkt_H", "mkt_D", "mkt_A") if c in result.table] + ["xg_home", "xg_away", "over25"]
-    print(result.table[cols].to_string(index=False, float_format=lambda x: f"{x:.2f}"))
-
+        [c for c in ("mkt_H", "mkt_D", "mkt_A") if c in t] + ["xg_home", "xg_away", "over25"] + \
+        [c for c in ("mkt_over25", "hg", "ag") if c in t]
+    print(t[cols].to_string(index=False, float_format=lambda x: f"{x:.2f}"))
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     stem = out / f"{args.league}_forecast_{as_of:%Y%m%d}"
-    result.table.to_csv(stem.with_suffix(".csv"), index=False)
+    t.to_csv(stem.with_suffix(".csv"), index=False)
     stem.with_suffix(".html").write_text(report.render(result, args.league), encoding="utf-8")
     print(f"saved {stem}.html and .csv")
-    return 0
 
 
 def _add_data_args(p: argparse.ArgumentParser) -> None:
@@ -277,6 +383,13 @@ def main(argv: list[str] | None = None) -> int:
     fl.add_argument("--delay", type=float, default=1.0, help="seconds between requests")
     fl.add_argument("--limit", type=int, help="download at most N rosters this run")
     fl.set_defaults(func=cmd_fetch_lineups)
+
+    cp = sub.add_parser("compare", help="backtest several leagues with one frozen configuration")
+    _add_data_args(cp)
+    cp.add_argument("--leagues", default="E0,SP1,I1,D1,F1")
+    cp.add_argument("--min-edge", type=float, default=0.03)
+    cp.add_argument("--out-dir", default="reports")
+    cp.set_defaults(func=cmd_compare)
 
     pr = sub.add_parser("predict", help="forecast upcoming fixtures and write an HTML report")
     _add_data_args(pr)

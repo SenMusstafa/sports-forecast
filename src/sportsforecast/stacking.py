@@ -11,7 +11,7 @@ import pandas as pd
 from scipy.optimize import minimize
 from scipy.special import softmax
 
-from .metrics import OUTCOME_INDEX
+from .metrics import ONE_X_TWO, Market
 
 
 class LinearPool:
@@ -34,16 +34,16 @@ class LinearPool:
         return np.einsum("nko,k->no", probs, self.weights)
 
 
-def walk_forward(preds: pd.DataFrame, components: list[str], name: str,
-                 refit_days: int = 7, min_train: int = 380) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Returns (probabilities aligned to preds.index with columns name_H/D/A, weight history)."""
-    out = pd.DataFrame(np.nan, index=preds.index, columns=[f"{name}_{o}" for o in "HDA"])
-    usable = preds.dropna(subset=[f"{c}_{o}" for c in components for o in "HDA"])
+def walk_forward(preds: pd.DataFrame, components: list[str], name: str, refit_days: int = 7,
+                 min_train: int = 380, market: Market = ONE_X_TWO) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Returns (probabilities aligned to preds.index with columns market.cols(name), weight history)."""
+    out = pd.DataFrame(np.nan, index=preds.index, columns=market.cols(name))
+    usable = preds.dropna(subset=[c for comp in components for c in market.cols(comp)] + [market.result_col])
     if len(usable) <= min_train:
         return out, pd.DataFrame()
 
-    probs = np.stack([usable[[f"{c}_{o}" for o in "HDA"]].to_numpy() for c in components], axis=1)
-    y = usable["result"].map(OUTCOME_INDEX).to_numpy()
+    probs = np.stack([usable[market.cols(c)].to_numpy() for c in components], axis=1)
+    y = market.index(usable[market.result_col])
     dates = usable["date"].to_numpy()
     pool = LinearPool(components)
     history = []

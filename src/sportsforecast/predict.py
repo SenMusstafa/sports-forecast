@@ -22,7 +22,7 @@ from . import xg
 from .data import DataSourceError, current_season, read_csv
 from .dixon_coles import DixonColes, markets, score_matrix
 from .elo import Elo, OrderedLogit
-from .metrics import OUTCOME_INDEX, evaluate
+from .metrics import OUTCOME_INDEX, TOTALS, evaluate
 from .odds import devig
 
 log = logging.getLogger(__name__)
@@ -97,6 +97,7 @@ class ForecastResult:
     lineup_beta: float | None
     validation: pd.DataFrame  # backtest scores of blend vs market, shown in the report for context
     as_of: pd.Timestamp
+    scores: pd.DataFrame | None = None  # past-window mode: forecasts scored against actual results
 
 
 def _blend_weights(result: backtest.BacktestResult) -> dict[str, float]:
@@ -173,3 +174,47 @@ def _attach_fixture_market(table: pd.DataFrame, fixtures: pd.DataFrame, method: 
         ou = np.column_stack([fixtures["odds_over"], fixtures["odds_under"]])
         implied = 1.0 / ou
         table["mkt_over25"] = implied[:, 0] / implied.sum(axis=1)
+
+
+def past_fixtures(history: pd.DataFrame, as_of: pd.Timestamp, days: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Already played matches in [as_of, as_of + days) presented as fixtures, priced at the opening line.
+
+    Returns (fixtures, played rows). forecast() only sees history before the first fixture, so the
+    results and closing prices of the window cannot leak into the forecasts.
+    """
+    played = history[(history["date"] >= as_of) & (history["date"] < as_of + pd.Timedelta(days=days))]
+    played = played.reset_index(drop=True)
+    fixtures = played[["date", "home", "away"]].assign(time="")
+    opening = "open_h" in played and played["open_h"].notna().all()
+    src = ("open_h", "open_d", "open_a") if opening else ("odds_h", "odds_d", "odds_a")
+    if set(src) <= set(played.columns):
+        fixtures[["odds_h", "odds_d", "odds_a"]] = played[list(src)].to_numpy()
+        fixtures["odds_source"] = "opening" if opening else "closing (no opening prices)"
+    ou_open = "ou_open_over" in played and played["ou_open_over"].notna().all()
+    ou_src = ("ou_open_over", "ou_open_under") if ou_open else ("ou_over", "ou_under")
+    if set(ou_src) <= set(played.columns):
+        fixtures[["odds_over", "odds_under"]] = played[list(ou_src)].to_numpy()
+    return fixtures, played
+
+
+def score_past(result: ForecastResult, played: pd.DataFrame, method: str = "shin") -> ForecastResult:
+    """Attach actual results and score model, opening market and closing market on the window."""
+    t = result.table.copy()
+    t[["hg", "ag", "result"]] = played[["hg", "ag", "result"]].to_numpy()
+    t["total25"] = np.where(t["hg"] + t["ag"] > 2.5, "O", "U")
+    t["model25_O"], t["model25_U"] = t["over25"], 1 - t["over25"]
+    if "mkt_over25" in t:
+        t["open25_O"], t["open25_U"] = t["mkt_over25"], 1 - t["mkt_over25"]
+    if {"odds_h", "open_h"} <= set(played.columns):
+        t[["close_H", "close_D", "close_A"]] = devig(played[["odds_h", "odds_d", "odds_a"]].to_numpy(), method)
+    if {"ou_over", "ou_open_over"} <= set(played.columns):
+        t[["close25_O", "close25_U"]] = devig(played[["ou_over", "ou_under"]].to_numpy(), method)
+
+    one_x_two = evaluate(t, ["model", "mkt", "close"], common=True).rename(
+        index={"model": "model", "mkt": "market (opening)", "close": "market (closing)"})
+    totals = evaluate(t, ["model25", "open25", "close25"], common=True, market=TOTALS).rename(
+        index={"model25": "model", "open25": "market (opening)", "close25": "market (closing)"})
+    scores = pd.concat({"1X2": one_x_two.drop(columns="accuracy"),
+                        "Over/Under 2.5": totals.drop(columns=["rps", "accuracy"])})
+    result.table, result.scores = t, scores
+    return result
