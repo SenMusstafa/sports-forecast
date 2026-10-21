@@ -31,6 +31,7 @@ th { color:var(--muted); font-weight:500; }
 .pos { color:var(--pos); } .neg { color:var(--neg); }
 .meta { display:flex; flex-wrap:wrap; gap:4px 16px; margin-top:8px; font-size:13px; color:var(--muted); }
 .warn { color:var(--neg); font-size:13px; margin-top:6px; }
+.final { margin-left:8px; padding:1px 8px; border-radius:6px; background:var(--line); font-weight:700; }
 """
 
 
@@ -67,9 +68,11 @@ def _card(r: pd.Series) -> str:
         over += f" (market {_pct(r['mkt_over25'])})"
     warn = (f'<div class="warn">No history for {html.escape(r["new_team"])}: rated as a weak newcomer</div>'
             if r["new_team"] else "")
+    score = (f' <span class="final">{int(r["hg"])}–{int(r["ag"])}</span>'
+             if "hg" in r and pd.notna(r.get("hg")) else "")
     return f"""
 <div class="card">
-  <div class="teams"><span>{html.escape(r['home'])} – {html.escape(r['away'])}</span>
+  <div class="teams"><span>{html.escape(r['home'])} – {html.escape(r['away'])}{score}</span>
     <span class="when">{r['date']:%a %d %b} {html.escape(str(r['time']))}</span></div>
   <div class="bar">{bar}</div>
   <table><tr><th></th><th>Home</th><th>Draw</th><th>Away</th></tr>{body}</table>
@@ -92,6 +95,12 @@ def render(result: ForecastResult, league: str) -> str:
     beta = f" Lineup effect β = {result.lineup_beta:.2f} (not applied: lineups unknown before kick-off)." \
         if result.lineup_beta is not None else ""
     cards = "".join(_card(r) for _, r in t.iterrows())
+    scores = ""
+    if result.scores is not None:
+        table = result.scores.round(4).to_html(classes="scores", border=0, na_rep="–")
+        scores = (f"<h2>Scored against results</h2>{table}<p class='note'>{len(t)} matches is far too few "
+                  "to judge a model; differences of this size are mostly noise. The walk-forward backtest "
+                  "is the real test.</p>")
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(league)} Forecast</title><style>{CSS}</style></head>
@@ -99,6 +108,7 @@ def render(result: ForecastResult, league: str) -> str:
 <h1>{html.escape(league)} forecast</h1>
 <div class="sub">{len(t)} fixtures from {t['date'].min():%d %b %Y} · models fitted on data before {result.as_of:%d %b %Y}</div>
 <p class="note">{context} Blend weights: {weights}.{beta} Research output, not betting advice.</p>
+{scores}
 <h2>Fixtures</h2>
 {cards}
 </main></body></html>"""

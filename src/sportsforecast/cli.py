@@ -10,8 +10,9 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import backtest, clv, metrics, players, predict, report, tuning, understat, xg
-from .data import OFFICIAL_URL
+from . import backtest, clv, draws, metrics, players, predict, report, strategy, tuning, understat, xg
+from .data import MAIN_LEAGUES, OFFICIAL_URL, current_season
+from .understat import UnderstatError
 from .data import DataSourceError, load_league
 
 
@@ -30,7 +31,7 @@ MODEL_ORDER = ["elo", "dc", "dcx", "dcl", "ens", "blend", "open", "cons", "mkt",
 def _load(args: argparse.Namespace) -> pd.DataFrame | None:
     try:
         matches = load_league(args.league, expand_seasons(args.seasons), Path(args.data_dir))
-    except DataSourceError as exc:
+    except (DataSourceError, ValueError, KeyError) as exc:
         print(exc, file=sys.stderr)
         return None
     if args.xg or getattr(args, "lineups", False):
@@ -87,6 +88,8 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         print(f"Bets at opening odds, edge >= {args.min_edge} (CLV vs de-vigged closing line):")
         print(bet_table.round(4).to_string(), "\n")
 
+    _print_totals(result, args.min_edge)
+
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     stem = f"{args.league}_{seasons[0]}_{seasons[-1]}"
@@ -96,6 +99,241 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         history.to_csv(out / f"{stem}_{name}_weights.csv", index=False)
     print(f"saved {out / stem}_*.csv")
     return 0
+
+
+TOTALS_ORDER = ["dc25", "dcx25", "blend25", "open25", "mkt25", "stack25_open", "stack25"]
+
+
+def _print_totals(result: backtest.BacktestResult, min_edge: float) -> None:
+    preds = result.preds
+    table = metrics.evaluate(preds, TOTALS_ORDER, common=True, market=metrics.TOTALS)
+    if table.empty:
+        return
+    print("=== Over/Under 2.5 ===")
+    print(table.drop(columns="rps").round(4).to_string(), "\n")
+    for name in ("blend25", "stack25", "stack25_open"):
+        history = result.pool_weights.get(name)
+        if history is not None and not history.empty:
+            last = history.iloc[-1].drop("date")
+            print(f"{name} weights (last refit): " + ", ".join(f"{k}={v:.2f}" for k, v in last.items()))
+    best = "dcx25" if "dcx25_O" in preds else "dc25"
+    print(f"\n{best} calibration (over 2.5):")
+    print(metrics.calibration(preds, best, market=metrics.TOTALS, outcome="O").round(3).to_string(), "\n")
+    bet_table = clv.summary(preds, [best, "blend25", "stack25_open"], min_edge, market=metrics.TOTALS)
+    if not bet_table.empty:
+        print(f"Over/Under bets at opening odds, edge >= {min_edge} (CLV vs de-vigged closing line):")
+        print(bet_table.round(4).to_string(), "\n")
+
+
+def _summary_row(league: str, result: backtest.BacktestResult, min_edge: float) -> dict:
+    """One line per league: how far the models are from the market and whether they add anything to it."""
+    preds, row = result.preds, {"league": league, "matches": len(result.preds)}
+    one = metrics.evaluate(preds, ["blend", "mkt"], common=True)
+    if {"blend", "mkt"} <= set(one.index):
+        row.update(blend_rps=one.loc["blend", "rps"], mkt_rps=one.loc["mkt", "rps"],
+                   gap_rps=one.loc["blend", "rps"] - one.loc["mkt", "rps"])
+    tot = metrics.evaluate(preds, ["blend25", "dcx25", "dc25", "mkt25"], common=True, market=metrics.TOTALS)
+    model25 = next((m for m in ("blend25", "dcx25", "dc25") if m in tot.index), None)
+    if model25 and "mkt25" in tot.index:
+        row.update(model25_brier=tot.loc[model25, "brier"], mkt25_brier=tot.loc["mkt25", "brier"],
+                   gap25_brier=tot.loc[model25, "brier"] - tot.loc["mkt25", "brier"])
+    for name, market_name, col in (("stack", "mkt", "model_w_1x2"), ("stack25", "mkt25", "model_w_ou")):
+        h = result.pool_weights.get(name)
+        if h is not None and not h.empty:
+            row[col] = 1 - h.iloc[-1][market_name]
+    for model, market, col in (("stack_open", metrics.ONE_X_TWO, "clv_1x2"),
+                               ("stack25_open", metrics.TOTALS, "clv_ou")):
+        b = clv.bets(preds, model, min_edge, market)
+        if not b.empty:
+            row[col], row[f"{col}_bets"] = b["clv"].mean(), len(b)
+    h = result.pool_weights.get("lineup_beta")
+    if h is not None and not h.empty:
+        row["lineup_beta"] = h.iloc[-1]["beta"]
+    return row
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    """Same frozen configuration on every league: consistency across leagues is the robustness test."""
+    rows = []
+    for league in args.leagues.split(","):
+        args.league = league
+        matches = _load(args)
+        if matches is None:
+            print(f"{league}: skipped (data unavailable)", file=sys.stderr)
+            continue
+        cfg = backtest.BacktestConfig(burn_in_seasons=args.burn_in)
+        try:
+            rows.append(_summary_row(league, backtest.run(matches, cfg), args.min_edge))
+        except (ValueError, KeyError) as exc:
+            print(f"{league}: skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
+            continue
+        print(f"{league}: done")
+    table = pd.DataFrame(rows).set_index("league")
+    print("\ngap_* > 0: market better; model_w_*: weight the stack gives the models next to the closing "
+          "market; clv_*: mean closing-line value of stack bets at opening odds\n")
+    print(table.round(4).to_string())
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    seasons = expand_seasons(args.seasons)
+    path = out / f"compare_{seasons[0]}_{seasons[-1]}.csv"
+    table.to_csv(path)
+    print(f"\nsaved {path}")
+    return 0
+
+
+def cmd_strategy(args: argparse.Namespace) -> int:
+    rules = strategy.load_rules(Path(args.rules))
+    per_league = {}
+    for league in args.leagues.split(","):
+        args.league = league
+        matches = _load(args)
+        if matches is None:
+            print(f"{league}: skipped (data unavailable)", file=sys.stderr)
+            continue
+        try:
+            per_league[league] = backtest.run(matches, backtest.BacktestConfig(burn_in_seasons=args.burn_in)).preds
+        except (ValueError, KeyError) as exc:
+            print(f"{league}: skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
+            continue
+        print(f"{league}: backtest done")
+    pooled, by_league = strategy.evaluate(per_league, rules, args.validation_seasons)
+
+    # Each rule is tested in two periods; a Bonferroni bar keeps chance findings out
+    alpha = 0.05 / max(len(rules), 1)
+    validation = pooled.index.get_level_values("period") == "validation"
+    pooled["promising"] = validation & (pooled.get("clv", 0) > 0) & (pooled.get("clv_p", 1) < alpha)
+    print(f"\n{len(rules)} pre-registered rules from {args.rules}. Bets at opening odds, 1 unit each.")
+    print("hit vs implied: actual frequency vs de-vigged opening probability; clv: mean closing-line value; "
+          f"a rule is only promising if validation clv > 0 with clv_p < {alpha:.4f} (0.05 / rules)\n")
+    print(pooled.round(4).to_string(), "\n")
+    print("Validation period by league:")
+    print(by_league.round(4).to_string())
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    pooled.to_csv(out / "strategy_pooled.csv")
+    by_league.to_csv(out / "strategy_by_league.csv")
+    print(f"\nsaved {out}/strategy_*.csv")
+    return 0
+
+
+def _draw_history(args: argparse.Namespace, before: pd.Timestamp | None = None) -> tuple[pd.DataFrame, dict]:
+    """Walk-forward backtest of every league (only matches before `before`), as pooled draw features."""
+    leagues = MAIN_LEAGUES if args.leagues.lower() == "all" else args.leagues.split(",")
+    feats, per_league = [], {}
+    for league in leagues:
+        args.league = league
+        matches = _load(args)
+        if matches is None:
+            print(f"{league}: skipped (data unavailable)", file=sys.stderr)
+            continue
+        history = matches if before is None else matches[matches["date"] < before].reset_index(drop=True)
+        try:
+            result = backtest.run(history, backtest.BacktestConfig(burn_in_seasons=args.burn_in))
+        except (ValueError, KeyError) as exc:
+            print(f"{league}: skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
+            continue
+        per_league[league] = (matches, history, result)
+        feats.append(draws.features(result.preds, league))
+        print(f"{league}: {len(result.preds)} matches")
+    return draws.add_league_draw_rate(pd.concat(feats, ignore_index=True)), per_league
+
+
+def cmd_draws_backtest(args: argparse.Namespace) -> int:
+    f, _ = _draw_history(args)
+    scored = draws.walk_forward(f)
+    seasons = sorted(scored["season"].unique())
+    valid = scored[scored["season"].isin(seasons[-args.validation_seasons:])]
+    ns = tuple(int(n) for n in args.top.split(","))
+    print(f"\n{scored['league'].nunique()} leagues, {len(scored)} matches scored walk-forward "
+          f"({scored['week'].nunique()} weeks). Lists are the top-N matches of each week across all leagues.\n")
+    for label, part in (("All scored seasons", scored), (f"Validation seasons {seasons[-args.validation_seasons:]}", valid)):
+        print(f"=== {label} ===")
+        print(draws.evaluate(part, ns).round(4).to_string(), "\n")
+        print(draws.binary_scores(part).round(5).to_string(), "\n")
+    model = draws.DrawModel(draws.FEATURES).fit(draws.usable(f), draws.usable(f)["draw"].to_numpy())
+    print("Combined model, standardised weights (fit on all data, for interpretation only):")
+    print(", ".join(f"{k}={v:+.3f}" for k, v in model.weights().items()))
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    scored.to_csv(out / "draws_backtest.csv", index=False)
+    print(f"\nsaved {out}/draws_backtest.csv")
+    return 0
+
+
+def cmd_draws_list(args: argparse.Namespace) -> int:
+    """Everything is frozen at --as-of: models, draw model and league rates see only earlier matches.
+
+    A past --as-of replays the window exactly as a list made that morning (opening odds as prices),
+    then shows the results; a current --as-of uses fixtures.csv.
+    """
+    as_of = pd.Timestamp(args.as_of) if args.as_of else pd.Timestamp.today().normalize()
+    end = as_of + pd.Timedelta(days=args.days)
+    past = as_of < pd.Timestamp.today().normalize()
+    if args.seasons is None:
+        args.seasons = f"1819-{current_season(as_of)}"
+    f, per_league = _draw_history(args, before=as_of)
+
+    rows, played_rows = [], []
+    for league, (matches, history, result) in per_league.items():
+        if past:
+            fixtures, played = predict.past_fixtures(matches, as_of, args.days)
+        else:
+            try:
+                fixtures = predict.fetch_fixtures(league, Path(args.data_dir))
+            except DataSourceError as exc:
+                print(f"fixtures: {exc}", file=sys.stderr)
+                return 2
+            fixtures = fixtures[(fixtures["date"] >= as_of) & (fixtures["date"] < end)].reset_index(drop=True)
+        if fixtures.empty or "odds_h" not in fixtures:
+            continue
+        cfg = backtest.BacktestConfig(burn_in_seasons=args.burn_in)
+        table = predict.forecast(history, fixtures, cfg, result).table
+        table["odds_d"] = fixtures["odds_d"].to_numpy()
+        rows.append(draws.fixture_features(table, league))
+        if past:
+            played_rows.append(played.assign(league=league)[["league", "home", "away", "date", "hg", "ag", "result"]])
+    if not rows:
+        print(f"no fixtures with odds between {as_of:%Y-%m-%d} and {end:%Y-%m-%d}"
+              + ("" if past else f" (fixtures.csv leagues: {', '.join(predict.fixture_leagues(Path(args.data_dir)))})"),
+              file=sys.stderr)
+        return 1
+
+    window = pd.concat(rows, ignore_index=True)
+    combined = draws.add_league_draw_rate(pd.concat([f, window], ignore_index=True))
+    history_f, window = draws.usable(combined[combined["draw"].notna()]), combined[combined["draw"].isna()].copy()
+    window = window.dropna(subset=["market_D"])
+    window["p_combined"] = draws.DrawModel(draws.FEATURES).fit(history_f, history_f["draw"].to_numpy()).predict(window)
+    window["p_market"] = draws.DrawModel(draws.MARKET_ONLY).fit(history_f, history_f["draw"].to_numpy()).predict(window)
+    cols = ["date", "time", "league", "home", "away", "market_D", "p_combined", "draw_odds"]
+    picks = window.nlargest(args.top, "p_combined")
+    print(f"\nTop {args.top} draw candidates {as_of:%Y-%m-%d}..{end:%Y-%m-%d} of {len(window)} matches "
+          f"(everything fitted on data before {as_of:%Y-%m-%d}):")
+
+    if past:
+        results = pd.concat(played_rows, ignore_index=True)
+        results["score"] = results["hg"].astype(int).astype(str) + "-" + results["ag"].astype(int).astype(str)
+        picks = picks.drop(columns=["draw", "score"], errors="ignore").merge(results[["league", "home", "away", "score", "result"]],
+                                                   on=["league", "home", "away"], how="left")
+        picks["draw"] = (picks["result"] == "D").astype(int)
+        print(picks[cols + ["score"]].to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+        market_picks = window.nlargest(args.top, "p_market").merge(results, on=["league", "home", "away"])
+        print(f"\ndraws in list: {picks['draw'].sum()}/{len(picks)} (expected {picks['p_combined'].sum():.2f}); "
+              f"market-only list: {(market_picks['result'] == 'D').sum()}/{len(market_picks)}; "
+              f"all {len(results)} matches: {(results['result'] == 'D').mean():.1%} draws")
+        print("One window says little: the hit count of a 5-7 match list swings by ±1-2 draws by chance.")
+    else:
+        print(picks[cols].to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+        print(f"\nexpected draws in the list: {picks['p_combined'].sum():.2f} of {len(picks)}")
+    _save_draw_list(args, picks, as_of)
+    return 0
+
+
+def _save_draw_list(args: argparse.Namespace, picks: pd.DataFrame, as_of: pd.Timestamp) -> None:
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / f"draws_{as_of:%Y%m%d}.csv"
+    picks.to_csv(path, index=False)
+    print(f"saved {path}")
 
 
 def cmd_tune(args: argparse.Namespace) -> int:
@@ -188,39 +426,85 @@ def _probe_match(league: str, year: int) -> str:
 def cmd_predict(args: argparse.Namespace) -> int:
     as_of = pd.Timestamp(args.as_of) if args.as_of else pd.Timestamp.today().normalize()
     if args.seasons is None:
-        last = int(predict.current_season(as_of)[:2])
+        last = int(current_season(as_of)[:2])
         args.seasons = f"{last - args.history:02d}{last - args.history + 1:02d}-{last:02d}{last + 1:02d}"
     history = _load(args)
     if history is None:
         return 2
+    if as_of < pd.Timestamp.today().normalize():
+        return _predict_past(args, history, as_of)
     try:
         fixtures = predict.fetch_fixtures(args.league, Path(args.data_dir))
     except DataSourceError as exc:
         print(exc, file=sys.stderr)
         return 2
-    fixtures = fixtures[(fixtures["date"] >= as_of) & (fixtures["date"] < as_of + pd.Timedelta(days=args.days))]
-    if fixtures.empty:
-        print(f"no {args.league} fixtures in the next {args.days} days from {as_of:%Y-%m-%d}", file=sys.stderr)
+    def in_window(f: pd.DataFrame) -> pd.DataFrame:
+        return f[(f["date"] >= as_of) & (f["date"] < as_of + pd.Timedelta(days=args.days))]
+
+    window = in_window(fixtures)
+    if window.empty and args.xg:
+        try:
+            window = in_window(predict.understat_fixtures(history, args.league, Path(args.data_dir),
+                                                          current_season(as_of)))
+            if not window.empty:
+                print(f"fixtures.csv has no {args.league} matches in the window; using the Understat "
+                      f"schedule (no odds, so no market comparison)")
+        except UnderstatError as exc:
+            print(f"understat fallback failed: {exc}", file=sys.stderr)
+    if window.empty:
+        span = (f"{len(fixtures)} {args.league} fixtures dated {fixtures['date'].min():%Y-%m-%d}.."
+                f"{fixtures['date'].max():%Y-%m-%d}" if len(fixtures) else f"no {args.league} fixtures at all")
+        print(f"no {args.league} fixtures in the next {args.days} days from {as_of:%Y-%m-%d}; "
+              f"fixtures.csv has {span} (leagues: {', '.join(predict.fixture_leagues(Path(args.data_dir)))}). "
+              f"The file is refreshed when older than 3h; delete data/raw/fixtures.csv to force it.",
+              file=sys.stderr)
         return 1
+    fixtures = window
     fixtures = fixtures.reset_index(drop=True)
     print(f"{args.league}: history {args.seasons} ({len(history)} matches), {len(fixtures)} fixtures")
 
+    result = predict.forecast(history, fixtures, _predict_config(args))
+    _save_forecast(args, result, as_of)
+    return 0
+
+
+def _predict_config(args: argparse.Namespace) -> backtest.BacktestConfig:
     cfg = backtest.BacktestConfig(burn_in_seasons=args.burn_in)
     if args.params:
         cfg = tuning.apply_params(cfg, tuning.load_params(Path(args.params)))
-    result = predict.forecast(history, fixtures, cfg)
+    return cfg
 
+
+def _predict_past(args: argparse.Namespace, history: pd.DataFrame, as_of: pd.Timestamp) -> int:
+    """Forecast an already played window as if it were upcoming, then score it."""
+    fixtures, played = predict.past_fixtures(history, as_of, args.days)
+    if fixtures.empty:
+        print(f"no played {args.league} matches between {as_of:%Y-%m-%d} and "
+              f"{as_of + pd.Timedelta(days=args.days):%Y-%m-%d}", file=sys.stderr)
+        return 1
+    print(f"{args.league}: past window {as_of:%Y-%m-%d} +{args.days}d, {len(fixtures)} played matches; "
+          f"models see only data before {fixtures['date'].min():%Y-%m-%d}, market = "
+          f"{fixtures['odds_source'].iloc[0] if 'odds_source' in fixtures else 'none'} odds")
+    result = predict.score_past(predict.forecast(history, fixtures, _predict_config(args)), played)
+    _save_forecast(args, result, as_of)
+    print(f"\nScores on these {len(fixtures)} matches (lower is better; one round is far too few "
+          f"to judge a model, the backtest is the real test):")
+    print(result.scores.round(4).to_string())
+    return 0
+
+
+def _save_forecast(args: argparse.Namespace, result: predict.ForecastResult, as_of: pd.Timestamp) -> None:
+    t = result.table
     cols = ["date", "home", "away", "model_H", "model_D", "model_A"] + \
-        [c for c in ("mkt_H", "mkt_D", "mkt_A") if c in result.table] + ["xg_home", "xg_away", "over25"]
-    print(result.table[cols].to_string(index=False, float_format=lambda x: f"{x:.2f}"))
-
+        [c for c in ("mkt_H", "mkt_D", "mkt_A") if c in t] + ["xg_home", "xg_away", "over25"] + \
+        [c for c in ("mkt_over25", "hg", "ag") if c in t]
+    print(t[cols].to_string(index=False, float_format=lambda x: f"{x:.2f}"))
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     stem = out / f"{args.league}_forecast_{as_of:%Y%m%d}"
-    result.table.to_csv(stem.with_suffix(".csv"), index=False)
+    t.to_csv(stem.with_suffix(".csv"), index=False)
     stem.with_suffix(".html").write_text(report.render(result, args.league), encoding="utf-8")
     print(f"saved {stem}.html and .csv")
-    return 0
 
 
 def _add_data_args(p: argparse.ArgumentParser) -> None:
@@ -258,6 +542,40 @@ def main(argv: list[str] | None = None) -> int:
     fl.add_argument("--delay", type=float, default=1.0, help="seconds between requests")
     fl.add_argument("--limit", type=int, help="download at most N rosters this run")
     fl.set_defaults(func=cmd_fetch_lineups)
+
+    cp = sub.add_parser("compare", help="backtest several leagues with one frozen configuration")
+    _add_data_args(cp)
+    cp.add_argument("--leagues", default="E0,SP1,I1,D1,F1")
+    cp.add_argument("--min-edge", type=float, default=0.03)
+    cp.add_argument("--out-dir", default="reports")
+    cp.set_defaults(func=cmd_compare)
+
+    st = sub.add_parser("strategy", help="evaluate pre-registered betting rules (strategies/rules.toml)")
+    _add_data_args(st)
+    st.add_argument("--leagues", default="E0,SP1,I1,D1,F1")
+    st.add_argument("--rules", default="strategies/rules.toml")
+    st.add_argument("--validation-seasons", type=int, default=2, help="last N seasons held out for validation")
+    st.add_argument("--out-dir", default="reports")
+    st.set_defaults(func=cmd_strategy)
+
+    dr = sub.add_parser("draws", help="rank matches by draw probability (market + models + history)")
+    dsub = dr.add_subparsers(dest="draws_command", required=True)
+    db = dsub.add_parser("backtest", help="weekly top-N draw lists over past seasons, all leagues pooled")
+    _add_data_args(db)
+    db.add_argument("--leagues", default="all", help="'all' or comma list of football-data codes")
+    db.add_argument("--top", default="3,5,7")
+    db.add_argument("--validation-seasons", type=int, default=2)
+    db.add_argument("--out-dir", default="reports")
+    db.set_defaults(func=cmd_draws_backtest)
+    dl = dsub.add_parser("list", help="top draw candidates for a window (past: with results; future: fixtures)")
+    _add_data_args(dl)
+    dl.set_defaults(seasons=None)
+    dl.add_argument("--leagues", default="all")
+    dl.add_argument("--as-of", help="YYYY-MM-DD, default today")
+    dl.add_argument("--days", type=int, default=7)
+    dl.add_argument("--top", type=int, default=7)
+    dl.add_argument("--out-dir", default="reports")
+    dl.set_defaults(func=cmd_draws_list)
 
     pr = sub.add_parser("predict", help="forecast upcoming fixtures and write an HTML report")
     _add_data_args(pr)

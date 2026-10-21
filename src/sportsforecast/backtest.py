@@ -12,7 +12,7 @@ from . import stacking
 from .data import BOOKMAKERS
 from .dixon_coles import DixonColes, DixonColesConfig, markets, score_matrix
 from .elo import Elo, EloConfig, OrderedLogit
-from .metrics import OUTCOME_INDEX
+from .metrics import OUTCOME_INDEX, TOTALS
 from .odds import devig
 
 log = logging.getLogger(__name__)
@@ -75,19 +75,22 @@ def run(matches: pd.DataFrame, cfg: BacktestConfig | None = None) -> BacktestRes
             row = {
                 "date": m.date, "season": m.season, "home": m.home, "away": m.away,
                 "hg": m.hg, "ag": m.ag, "result": m.result, "elo_diff": diff,
+                "total25": "O" if m.hg + m.ag > 2.5 else "U",
                 "elo_H": p_elo[0], "elo_D": p_elo[1], "elo_A": p_elo[2],
             }
             if dc:
                 p_dc = dc.predict(m.home, m.away)
                 row.update({"dc_H": p_dc["H"], "dc_D": p_dc["D"], "dc_A": p_dc["A"],
                             "dc_over25": p_dc["over25"], "dc_btts": p_dc["btts"],
-                            "dc_lam": p_dc["lam"], "dc_mu": p_dc["mu"], "dc_rho": p_dc["rho"]})
+                            "dc_lam": p_dc["lam"], "dc_mu": p_dc["mu"], "dc_rho": p_dc["rho"],
+                            "dc25_O": p_dc["over25"], "dc25_U": 1 - p_dc["over25"]})
                 if "home_lineup_delta" in matches:
                     row.update({"home_lineup_delta": m.home_lineup_delta, "away_lineup_delta": m.away_lineup_delta})
             if dcx:
                 p_dcx = dcx.predict(m.home, m.away)
                 row.update({"dcx_H": p_dcx["H"], "dcx_D": p_dcx["D"], "dcx_A": p_dcx["A"],
-                            "dcx_lam": p_dcx["lam"], "dcx_mu": p_dcx["mu"], "dcx_rho": p_dcx["rho"]})
+                            "dcx_lam": p_dcx["lam"], "dcx_mu": p_dcx["mu"], "dcx_rho": p_dcx["rho"],
+                            "dcx25_O": p_dcx["over25"], "dcx25_U": 1 - p_dcx["over25"]})
             rows.append(row)
 
         elo.update(m.home, m.away, m.hg, m.ag)
@@ -117,6 +120,18 @@ def run(matches: pd.DataFrame, cfg: BacktestConfig | None = None) -> BacktestRes
         pools["stack_open"] = models + ["open"]
     for name, components in pools.items():
         probs, weights[name] = stacking.walk_forward(preds, components, name, cfg.refit_days, cfg.stack_min_train)
+        preds[probs.columns] = probs
+
+    # Over/Under 2.5: goal models vs the totals market, pooled the same way
+    goal_models = [m for m in ("dc25", "dcx25") if f"{m}_O" in preds]
+    totals_pools = {"blend25": goal_models} if len(goal_models) > 1 else {}
+    if "mkt25_O" in preds:
+        totals_pools["stack25"] = goal_models + ["mkt25"]
+    if "open25_O" in preds:
+        totals_pools["stack25_open"] = goal_models + ["open25"]
+    for name, components in totals_pools.items():
+        probs, weights[name] = stacking.walk_forward(preds, components, name, cfg.refit_days,
+                                                     cfg.stack_min_train, market=TOTALS)
         preds[probs.columns] = probs
 
     return BacktestResult(preds, weights)
@@ -158,11 +173,18 @@ def _lineup_adjusted(preds: pd.DataFrame, base: str, refit_days: int, min_train:
 
 
 def _attach_market(preds: pd.DataFrame, scored: pd.DataFrame, method: str) -> None:
-    """mkt = de-vigged closing line, open = de-vigged opening line, cons = mean of individual books."""
+    """mkt/open = de-vigged closing/opening 1X2, mkt25/open25 = same for over/under 2.5,
+    cons = mean of individual books' closing 1X2."""
     triples = {"mkt": ("odds_h", "odds_d", "odds_a"), "open": ("open_h", "open_d", "open_a")}
     for name, cols in triples.items():
         if set(cols) <= set(scored.columns):
             preds[[f"{name}_{o}" for o in "HDA"]] = devig(scored[list(cols)].to_numpy(), method)
+            preds[list(cols)] = scored[list(cols)].to_numpy()
+
+    totals = {"mkt25": ("ou_over", "ou_under"), "open25": ("ou_open_over", "ou_open_under")}
+    for name, cols in totals.items():
+        if set(cols) <= set(scored.columns):
+            preds[[f"{name}_O", f"{name}_U"]] = devig(scored[list(cols)].to_numpy(), method)
             preds[list(cols)] = scored[list(cols)].to_numpy()
 
     books = [b for b in BOOKMAKERS if f"book_{b}_h" in scored]
